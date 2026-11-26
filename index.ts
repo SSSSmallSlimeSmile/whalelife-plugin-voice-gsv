@@ -428,6 +428,15 @@ export async function apply(ctx: Context) {
     return out;
   }
 
+  /** 占一个新代际号，同时掐掉旧的：取号是同步的，掐是异步的。
+   *  取号必须排在 await 之前——两条并发的请求要是等 cancelSpeech 加完号才去读 gen，
+   *  会读到同一个号，两边的检查一起放行，结果是两句一起响。 */
+  function beginSpeech(): { mine: number; halted: Promise<void> } {
+    const mine = ++gen;
+    queue.length = 0;
+    return { mine, halted: stopPlayback().then(() => undefined, () => undefined) };
+  }
+
   /** 掐掉正在念的和排队的。gen 加一，正在跑的那轮合成/播放循环到下一个 await 点就知道收手。
    *  返回的 promise 等到播放子进程真的没了才落定——要接着开新的一句，就得等它。 */
   function cancelSpeech(): Promise<void> {
@@ -994,13 +1003,21 @@ export async function apply(ctx: Context) {
       // 播放这条路只有一把钥匙：跟 /say、mouth_say 共用 busy。
       // 不然两边各自起一个播放器，CURRENT_PLAY 只记得住后一个，先响的那句就掐不掉了。
       if (busy || queue.length) {
-        if (cfg.interrupt_reading) await cancelSpeech();
-        else throw new Error("上一段还在念，等它念完再试");
+        if (cfg.interrupt_reading) {
+          const { mine, halted } = beginSpeech();
+          await halted;
+          await waitIdle(mine);
+          if (mine !== gen) throw new Error(CANCELLED);
+        } else throw new Error("上一段还在念，等它念完再试");
       }
       const mine = gen;
       await waitIdle(mine);
       if (mine !== gen) throw new Error(CANCELLED);
-      if (busy || CURRENT_PLAY) throw new Error("上一段仍在收尾，稍后再试");
+      if (busy || CURRENT_PLAY) {
+        // 同上：等不到就排队，不丢这一句。
+        enqueue(text);
+        return `已排队：${text.slice(0, 40)}${text.length > 40 ? "…" : ""}\n上一段还在收尾，这句排在它后面念。${warn ? "\n注意：" + warn : ""}`;
+      }
       let file: string;
       busy = true;
       try {
@@ -1169,12 +1186,18 @@ export async function apply(ctx: Context) {
       await reload();
       if (busy || queue.length) {
         if (cfg.interrupt_reading) {
-          // 勾了「新的顶掉旧的」：掐掉再念，不返回 409。先等旧的那句真没了，免得两句叠响。
-          await cancelSpeech();
-          const mine = gen;
+          // 勾了「新的顶掉旧的」：先同步占号，再掐旧的，最后等旧的那句真没了，免得两句叠响。
+          // 占号排在 await 之前，并发的两条请求才会一个留下、另一个被判 CANCELLED。
+          const { mine, halted } = beginSpeech();
+          await halted;
           await waitIdle(mine);
           if (mine !== gen) throw new Error(CANCELLED);
-          if (busy) return replyJson(res, 503, { ok: false, error: "上一段仍在收尾，请稍后再试" });
+          if (busy) {
+            // 旧的合成请求还没回来，收手要几百毫秒到几秒。等不到就交给队列，
+            // 别让这一句凭空消失——它已经被掐掉一次了，不该再吃掉第二条。
+            enqueue(text);
+            return replyJson(res, 200, { ok: true, queued: true, text: "上一段还在收尾，这一句排在它后面接着念。" });
+          }
         } else {
           ctx.logger?.warn?.("念话请求", { status: "busy", chars: text.length });
           return replyJson(res, 409, { ok: false, error: "上一段还在念，等它念完" });
@@ -1206,11 +1229,14 @@ export async function apply(ctx: Context) {
       await reload();
       if (busy || queue.length) {
         if (cfg.interrupt_reading) {
-          await cancelSpeech();
-          const mine = gen;
+          const { mine, halted } = beginSpeech();
+          await halted;
           await waitIdle(mine);
           if (mine !== gen) throw new Error(CANCELLED);
-          if (busy) return replyJson(res, 503, { ok: false, error: "上一段仍在收尾，请稍后再试" });
+          if (busy) {
+            enqueue("嗓子通了，我是勘。这句话是用来试音色的。");
+            return replyJson(res, 200, { ok: true, queued: true, text: "上一段还在收尾，试音句排在它后面念。" });
+          }
         } else return replyJson(res, 409, { ok: false, error: "上一段还在念，等它念完" });
       }
       busy = true;
