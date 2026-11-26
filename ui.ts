@@ -297,7 +297,7 @@ export function renderPage(cfg: any, status: any = {}, ttsList: any[] = []): str
 
 <div class="pg-pair">
   <div class="pg-item"><div class="pg-row"><label class="pg-label" for="new_text">这段音频说的是什么</label><input type="text" id="new_text"><p class="pg-hint">要跟音频逐字对应，写错音色会飘。</p></div></div>
-  <div class="pg-item"><div class="pg-row"><label class="pg-label">操作</label><div class="pg-btns" style="margin:0"><button class="btn" type="button" id="reload_refs">读目录</button><button class="btn" type="button" id="save_voice">存成音色</button><button class="btn" type="button" id="del_voice">删掉选中的</button></div><p class="pg-hint" id="voice_list">—</p></div></div>
+  <div class="pg-item"><div class="pg-row"><label class="pg-label">操作</label><div class="pg-btns" style="margin:0"><button class="btn" type="button" id="reload_refs">读目录</button><button class="btn" type="button" id="save_voice">存成音色</button><button class="btn" type="button" id="check_ref">检查参考音</button><button class="btn" type="button" id="del_voice">删掉选中的</button></div><p class="pg-hint" id="voice_list">—</p></div></div>
 </div>
 
 <p class="pg-sub">手填 · 不用音色库时用这对</p>
@@ -305,6 +305,8 @@ export function renderPage(cfg: any, status: any = {}, ttsList: any[] = []): str
   <div class="pg-item"><div class="pg-row"><label class="pg-label" for="ref_audio">参考音频</label><input type="text" id="ref_audio" value="${esc(c.ref_audio)}"><p class="pg-hint">念的时候照着这个音色。留空则不念。目录要在启动参数 --allow-path 里。</p></div></div>
   <div class="pg-item"><div class="pg-row"><label class="pg-label" for="prompt_text">参考音频对应文本</label><input type="text" id="prompt_text" value="${esc(c.prompt_text)}"><p class="pg-hint">要跟上面的音频逐字对应，写错了音色会飘。</p></div></div>
 </div>
+</div>
+<div class="pg-result" id="ref_report" hidden></div>
 </section>
 
 <section class="pg-pg" id="pg-engine" hidden>
@@ -503,6 +505,55 @@ $("probe_model").onclick = async () => {
   }
 };
 $("voice_name").onchange = voiceSync;
+async function checkRef() {
+  const box = $("ref_report");
+  const name = $("voice_name").value.trim();
+  box.hidden = false;
+  box.className = "pg-result";
+  box.textContent = "正在检查…";
+  try {
+    const r = await post("/plugins/voice-gsv/check-ref", { voice: name });
+    if (r.ok === false) throw new Error(r.error || "检查没通过");
+    const rows = [];
+    rows.push(["音色", r.name ? r.name : "（不用库，用下面手填的那对）"]);
+    rows.push(["参考音频", r.refAudio || "（空）"]);
+    if (r.exists && r.wav) {
+      rows.push(["音频", r.bytes ? (r.bytes / 1024).toFixed(0) + " KB · " + r.wav.seconds + " 秒 · " + r.wav.rate + " Hz · " + r.wav.channels + " 声道 · " + r.wav.bits + " bit" : "读不出头"]);
+      if (r.wav.silence != null) rows.push(["静音占比", (r.wav.silence * 100).toFixed(1) + "%"]);
+    } else if (r.exists) {
+      rows.push(["音频", (r.bytes / 1024).toFixed(0) + " KB（读不出 wav 头）"]);
+    }
+    rows.push(["对应文本", r.promptText ? r.promptChars + " 字" : "（空）"]);
+    rows.push(["--allow-path", (r.allowDirs || []).join("；") || "（没配）"]);
+    const issues = Array.isArray(r.issues) ? r.issues : [];
+    const fails = issues.filter(function (one) { return one.level === "fail"; });
+    box.className = "pg-result " + (fails.length ? "err" : issues.length ? "wait" : "ok");
+    box.innerHTML = "";
+    rows.forEach(function (pair) {
+      const line = document.createElement("div");
+      line.textContent = pair[0] + "：" + pair[1];
+      box.appendChild(line);
+    });
+    if (!issues.length) {
+      const tail = document.createElement("div");
+      tail.textContent = "✅ 没发现问题，这套参考音可以直接用。";
+      box.appendChild(tail);
+      return;
+    }
+    issues.forEach(function (one) {
+      const line = document.createElement("div");
+      line.textContent = (one.level === "fail" ? "✕ " : "! ") + one.text;
+      box.appendChild(line);
+    });
+    const tail = document.createElement("div");
+    tail.textContent = fails.length ? "有 " + fails.length + " 条会让它念不出来，先改这些。" : "能念，只是有几处会让音色偏。";
+    box.appendChild(tail);
+  } catch (error) {
+    box.className = "pg-result err";
+    box.textContent = "检查失败：" + (error && error.message ? error.message : error);
+  }
+}
+$("check_ref").onclick = () => { checkRef(); };
 $("reload_refs").onclick = () => { loadRefs(); };
 $("refs").onchange = () => {
   const opt = $("refs").selectedOptions[0];

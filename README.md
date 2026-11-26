@@ -38,6 +38,7 @@ POST /plugins/voice-gsv/say        念一段文字（聊天页那颗「念」按
 POST /plugins/voice-gsv/test       念一句固定的试音话
 POST /plugins/voice-gsv/voices     读云端合法音色
 POST /plugins/voice-gsv/refs       列参考音目录里的 wav（音色库用）
+POST /plugins/voice-gsv/check-ref   检查当前音色的参考音能不能用（只读，不调引擎）
 POST /plugins/voice-gsv/save       保存（body: { top: {...}, gsv: {...} }）
 POST /plugins/voice-gsv/sync-refer 把当前音色设成引擎的默认参考音（见下节）
 ```
@@ -100,6 +101,22 @@ POST /plugins/voice-gsv/sync-refer 把当前音色设成引擎的默认参考音
 - 页面「音色」那页的「音色库」：下拉选当前音色；「读目录」从启动参数 `--allow-path` 的目录里列出 wav；挑一个填进表单，补上「这段音频说的是什么」，点「存成音色」。
 - `speak` 工具多一个 `voice` 参数，可以单次指定，不改配置。
 - `prompt_text` 必须跟音频逐字对应，写错音色会飘。这层没法自动校验，只能靠填的人。
+
+### 检查参考音
+
+音色页那个「检查参考音」按钮，只读、不调引擎，一次说清这套参考音能不能用。它查的都不是审美，是「引擎会怎么用这份文件」：
+
+- 文件在不在；不在启动参数的 `--allow-path` 里，引擎直接回 403
+- `prompt_text` 空没空——空着引擎不出声
+- 时长：短于 5 秒、长于 30 秒都提示
+- 静音占比（20ms 一帧、RMS 低于 0.5% 算静音）：超过 30% 提示，那些空段模型也会当特征学
+- 文本字数和音频长度的比例：正常中文 3–6 字/秒，差太远多半是那行字跟音频不是同一段
+- 采样率低于 32k 提示会重采样
+- 不是标准 RIFF/PCM 的 wav：说明时长和静音占比这两项判断不了，不硬猜
+
+这些提示分两档：`fail` 是会让它念不出来的（文件不在、不在白名单、文本为空），`warn` 是能念但音色会偏。
+
+实际跑过的六种：正常那套（只有静音 33.2% 一条 warn）、4.11 秒 43% 静音、文件不存在、不在 `--allow-path` 里的 wav、`prompt_text` 为空、非 wav 文件。返回的都是对应那一档。
 
 `/refs` 只读目录，不写、不删 wav。
 

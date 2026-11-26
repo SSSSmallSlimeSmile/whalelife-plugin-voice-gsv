@@ -472,6 +472,163 @@ export async function apply(ctx: Context) {
     return `配置里的音色「${name}」不在库里，现在用的是顶层那对参考音。库里有：${names.length ? names.join("、") : "（空）"}。`;
   }
 
+  /** 启动参数里的 --allow-path 目录。引擎只让读这些目录下的文件，别的路径回 403。 */
+  function allowDirs(): string[] {
+    const list: string[] = Array.isArray(g.args) ? (g.args as string[]) : [];
+    const dirs: string[] = [];
+    for (let i = 0; i < list.length - 1; i += 1) {
+      if (list[i] === "--allow-path" && list[i + 1]) dirs.push(list[i + 1]);
+    }
+    return dirs;
+  }
+
+  function normPath(one: string): string {
+    return String(one || "").replace(/[\\/]+/g, "\\").replace(/\\+$/, "").toLowerCase();
+  }
+
+  /** 只做字符串比较，不碰文件系统：跟 gsv_server 自己的 allow-path 判断口径一致（大小写不敏感）。 */
+  function underAllowPath(path: string, dirs: string[]): boolean {
+    const target = normPath(path);
+    return dirs.some((dir) => {
+      const base = normPath(dir);
+      if (!base) return false;
+      return target === base || target.startsWith(base + "\\");
+    });
+  }
+
+  /**
+   * 读一个 wav 的头，算出时长、采样率、静音占比。
+   * 只是为了让「检查参考音」能说人话，不参与合成。读不动就返回 null。
+   */
+  function inspectWav(path: string) {
+    try {
+      const buf = readFileSync(path);
+      if (buf.length < 44) return null;
+      if (buf.toString("ascii", 0, 4) !== "RIFF" || buf.toString("ascii", 8, 12) !== "WAVE") return null;
+      let at = 12;
+      let fmt: { tag: number; channels: number; rate: number; bits: number } | null = null;
+      let dataAt = 0;
+      let dataSize = 0;
+      while (at + 8 <= buf.length) {
+        const id = buf.toString("ascii", at, at + 4);
+        const size = buf.readUInt32LE(at + 4);
+        at += 8;
+        if (id === "fmt " && at + 16 <= buf.length) {
+          fmt = {
+            tag: buf.readUInt16LE(at),
+            channels: buf.readUInt16LE(at + 2),
+            rate: buf.readUInt32LE(at + 4),
+            bits: buf.readUInt16LE(at + 14),
+          };
+        } else if (id === "data") {
+          dataAt = at;
+          dataSize = Math.min(size, buf.length - at);
+          break;
+        }
+        at += size + (size % 2);
+      }
+      if (!fmt || !dataAt || !dataSize || !fmt.rate || !fmt.channels) return null;
+      const frameBytes = Math.max(1, (fmt.bits / 8) * fmt.channels);
+      const frames = Math.floor(dataSize / frameBytes);
+      const seconds = frames / fmt.rate;
+      // 静音占比：20ms 一帧，看每帧 RMS 是否低于 0.5%（-46 dB）。只认 8/16 位 PCM，别的算不出就不给。
+      let silence: number | null = null;
+      if ((fmt.bits === 16 || fmt.bits === 8) && fmt.tag === 1) {
+        const chunk = Math.max(1, Math.round(fmt.rate * 0.02));
+        let silent = 0;
+        let total = 0;
+        for (let f = 0; f + chunk <= frames; f += chunk) {
+          let sum = 0;
+          for (let i = 0; i < chunk; i += 1) {
+            const off = dataAt + (f + i) * frameBytes;
+            for (let c = 0; c < fmt.channels; c += 1) {
+              const p = off + c * (fmt.bits / 8);
+              if (p + fmt.bits / 8 > buf.length) break;
+              const v = fmt.bits === 16 ? buf.readInt16LE(p) / 32768 : (buf[p] - 128) / 128;
+              sum += v * v;
+            }
+          }
+          const rms = Math.sqrt(sum / (chunk * fmt.channels));
+          if (rms < 0.005) silent += 1;
+          total += 1;
+        }
+        silence = total ? silent / total : null;
+      }
+      return { bytes: buf.length, rate: fmt.rate, channels: fmt.channels, bits: fmt.bits, tag: fmt.tag, seconds, silence };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 检查当前这套参考音到底能不能用。只读，不落盘、不调引擎。
+   * 判据都来自「引擎会怎么用这份文件」，不是审美评分。
+   */
+  function checkRefer(want?: string) {
+    const dirs = allowDirs();
+    let picked: { name: string; ref_audio: string; prompt_text: string; prompt_lang: string };
+    try {
+      picked = resolveVoice(cfg, want);
+    } catch (error: any) {
+      return { ok: false, error: String(error?.message ?? error) };
+    }
+    const path = String(picked.ref_audio || "");
+    const prompt = String(picked.prompt_text || "");
+    const issues: { level: "fail" | "warn"; text: string }[] = [];
+    const info = path ? inspectWav(path) : null;
+    const exists = !!path && existsSync(path);
+    const inAllow = path ? underAllowPath(path, dirs) : false;
+
+    if (!path) issues.push({ level: "fail", text: "没配参考音频，念不了。填一个 wav 路径，或者从音色库里选一套。" });
+    else if (!exists) issues.push({ level: "fail", text: "文件不存在。路径写错了，或者那个 wav 被挪走了。" });
+    if (path && exists && !inAllow) {
+      issues.push({
+        level: "fail",
+        text: dirs.length
+          ? "这个文件不在启动参数的 --allow-path 里，引擎会回 403。把它的目录加进 --allow-path，或者换一个在目录里的文件。"
+          : "启动参数里没有 --allow-path，引擎什么参考音都不认。先在「引擎」页的启动参数里加 --allow-path。",
+      });
+    }
+    if (!prompt.trim()) issues.push({ level: "fail", text: "「这段音频说的是什么」是空的。引擎要拿它对齐音频，空着不出声。" });
+    if (info) {
+      if (info.seconds > 0 && info.seconds < 5) {
+        issues.push({ level: "warn", text: `只有 ${info.seconds.toFixed(2)} 秒。太短的话模型学到的音色偏紧，10–20 秒比较稳。` });
+      }
+      if (info.seconds > 30) issues.push({ level: "warn", text: `${info.seconds.toFixed(1)} 秒偏长，引擎按整段对齐，长段里带停顿容易拖音。` });
+      if (info.rate && info.rate < 32000) issues.push({ level: "warn", text: `采样率 ${info.rate} Hz 偏低，gsv.cpp 是 48k 那一档，会重采样。` });
+      if (info.silence != null && info.silence > 0.3) {
+        issues.push({ level: "warn", text: `静音占了 ${(info.silence * 100).toFixed(1)}%。参考音里空的部分，模型也会当特征学进去。` });
+      }
+      const chars = Array.from(prompt.trim()).length;
+      if (chars && info.seconds > 0) {
+        const perSec = chars / info.seconds;
+        if (perSec < 1.2 || perSec > 9) {
+          issues.push({
+            level: "warn",
+            text: `文本 ${chars} 字对 ${info.seconds.toFixed(2)} 秒音频，语速大约 ${perSec.toFixed(1)} 字/秒。正常中文是 3–6，差太远多半是那行字跟音频不是同一段，音色会飘。`,
+          });
+        }
+      }
+    } else if (path && exists) {
+      issues.push({ level: "warn", text: "读不出 wav 头（不是标准 RIFF/PCM？），时长和静音占比这两项没法判断。" });
+    }
+
+    return {
+      ok: true,
+      name: picked.name,
+      refAudio: path,
+      promptText: prompt,
+      promptChars: Array.from(prompt.trim()).length,
+      exists,
+      inAllowPath: inAllow,
+      allowDirs: dirs,
+      bytes: info?.bytes ?? 0,
+      wav: info ? { seconds: Number(info.seconds.toFixed(3)), rate: info.rate, channels: info.channels, bits: info.bits, silence: info.silence == null ? null : Number(info.silence.toFixed(3)) } : null,
+      issues,
+      pass: !issues.some((one) => one.level === "fail"),
+    };
+  }
+
   /** 引擎记住的默认参考音。gsv.cpp 重启后是空的，所以这份只在同一个引擎进程期间可信。 */
   let referSync: { ok: boolean; at: number; key: string; error: string } = { ok: false, at: 0, key: "", error: "" };
   const REFER_RETRY_MS = 60_000;
@@ -906,6 +1063,19 @@ export async function apply(ctx: Context) {
         voices: known.map((one) => ({ name: one?.name ?? "", ref_audio: one?.ref_audio ?? "", prompt_text: one?.prompt_text ?? "", prompt_lang: one?.prompt_lang ?? "" })),
         current: String(cfg.voice_name || ""),
       });
+    } catch (error: any) {
+      return replyJson(res, 500, { ok: false, error: error?.message ?? String(error) });
+    }
+  });
+
+  // 检查参考音：文件在不在、在不在 --allow-path 里、时长/静音占比、文本对不对得上。只读。
+  ctx.web.api("/plugins/voice-gsv/check-ref", async (req: any, res: any) => {
+    try {
+      await reload();
+      const body = await readBody(req);
+      const want = String((body as any)?.voice ?? "").trim();
+      const report = checkRefer(want || undefined);
+      return replyJson(res, report.ok === false ? 400 : 200, report);
     } catch (error: any) {
       return replyJson(res, 500, { ok: false, error: error?.message ?? String(error) });
     }
