@@ -1457,7 +1457,7 @@ export async function apply(ctx: Context) {
       if (String(body?.mode ?? "engine") === "engine") {
         const into = join(root, "runtime", "gsv");
         const r = startInstall({ url: ENGINE_ASSET.url, sha256: ENGINE_ASSET.sha256, root, into, extract: true });
-        return replyJson(res, 200, { ok: true, mode: "engine", ...r, note: "这个包只有 exe 和三个 ggml dll；sidecar、python、模型都不在里面，下完还得自己放" });
+        return replyJson(res, 200, { ok: true, mode: "engine", ...r, note: "这个包只有 exe 和四个 ggml DLL；sidecar、python、模型都在完整包里，需另行准备" });
       }
       const zip = String(body?.zip ?? "").trim();
       if (!zip) return replyJson(res, 400, { ok: false, error: "本地安装要给出 zip 的完整路径" });

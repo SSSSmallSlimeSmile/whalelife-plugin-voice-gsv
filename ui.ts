@@ -157,9 +157,10 @@ export function sanitize(input: any): { top: Record<string, unknown>; gsv: Recor
   }
   if ("args" in src) {
     const raw = src.args;
-    const list = Array.isArray(raw)
-      ? raw.map((one: any) => text(one)).filter(Boolean)
-      : text(raw).split(/\s+/).filter(Boolean);
+    const lines = Array.isArray(raw) ? raw : String(raw ?? "").split(/\r?\n/);
+    const list = lines.length === 1 && !Array.isArray(raw)
+      ? text(raw).split(/\s+/).filter(Boolean)
+      : lines.map((one: unknown) => text(one).replace(/^(["'])(.*)\1$/, "$2")).filter(Boolean);
     gsv.args = list.slice(0, 32);
   }
   return { top, gsv };
@@ -407,7 +408,7 @@ export function renderPage(cfg: any, status: any = {}, ttsList: any[] = []): str
 <div class="pg-item">
   <div class="pg-row"><label class="pg-label" for="dep_zip">完整包路径</label><input type="text" id="dep_zip" placeholder="...\\GSV.CPP-win64-0.1.0.zip"><p class="pg-hint">zip 的完整路径。<b>先点「看一下这个包」</b>，它会报大小和 sha256，包打不开也当场说；连大小都读不出来就别急着装。</p></div>
   <div class="pg-btns" style="margin:8px 0 0"><button class="btn" type="button" id="dep_hash">看一下这个包</button><button class="btn" type="button" id="dep_local">从本地包安装</button></div>
-  <p class="pg-hint">请使用顶层含 runtime\\ 的完整 ZIP。安装会覆盖同名文件，装之前请确认目标路径并备份。中途解压失败可能留下已解出的文件。</p>
+  <p class="pg-hint">请使用含 runtime\\gsv\\gsv_server.exe 的完整 ZIP，可套一层外目录。插件先解到临时目录，确认引擎文件后再合并。合并会覆盖同名文件，失败时可能留下部分更改。安装前请确认目标路径并备份。</p>
   <p class="pg-hint">断点续传只对「直接下载引擎包」有效：本地包这条路是一次解压，中途断了就是重来。</p>
 </div>
 
@@ -716,20 +717,21 @@ function depOut(kind, lines) {
     box.appendChild(line);
   });
 }
-async function depCheck() {
+async function depCheck(cleanupWarning) {
   depOut("wait", ["正在查…"]);
   try {
     var r = await post("/plugins/voice-gsv/deploy/check", { root: $("dep_root").value.trim() });
-    if (!r.root) return depOut("err", [r.reason || "推不出解包根目录，把上面的路径填上。"]);
+    if (!r.root) return depOut("err", [r.reason || "推不出解包根目录，把上面的路径填上。", cleanupWarning].filter(Boolean));
     var lines = [(r.ok ? "齐了。" : "缺 " + r.missing + " 项。") + "根目录：" + r.root];
     (r.items || []).forEach(function (it) {
       var bad = it.bytes === null || it.bytes < it.need;
       lines.push((bad ? "✗ " : "✓ ") + it.key + (it.bytes === null ? " 不在" : " " + sizeText(it.bytes)) + (it.note ? "（" + it.note + "）" : ""));
     });
     lines.push(r.voices && r.voices.length ? "音色：" + r.voices.join("、") : "音色：一套都没有（voices\<名字>\manifest.json）");
+    if (cleanupWarning) lines.push(cleanupWarning);
     depOut(r.ok ? "ok" : "err", lines);
   } catch (error) {
-    depOut("err", ["检查失败：" + (error && error.message ? error.message : error)]);
+    depOut("err", ["检查失败：" + (error && error.message ? error.message : error), cleanupWarning].filter(Boolean));
   }
 }
 var depTimer = null;
@@ -747,10 +749,11 @@ function depWatch() {
       var phase = { download: "下载中", verify: "校验中", extract: "解压中", done: "完成", failed: "失败" }[j.phase] || j.phase;
       var lines = [phase + (pct === null ? "" : " " + pct + "%") + " · " + Math.round(j.bytes / 1048576) + (j.total ? " / " + Math.round(j.total / 1048576) : "") + " MB"];
       lines.push("文件：" + j.dest);
-      lines.push("解到：" + j.into + (j.shape ? "（" + (j.shape === "packaged" ? "完整包，按原结构" : "引擎包，落到 runtime\\gsv") + "）" : ""));
+      lines.push("解到：" + j.into + (j.shape ? "（" + (j.shape === "packaged" ? "完整包，按原结构" : "独立引擎包") + "）" : ""));
       if (j.error) lines.push("原因：" + j.error);
+      if (j.cleanupWarning) lines.push(j.cleanupWarning);
       depOut(j.phase === "failed" ? "err" : j.phase === "done" ? "ok" : "wait", lines);
-      if (j.phase === "done" || j.phase === "failed") { depStop(); if (j.phase === "done") depCheck(); return; }
+      if (j.phase === "done" || j.phase === "failed") { depStop(); if (j.phase === "done") depCheck(j.cleanupWarning); return; }
       depWatch();
     } catch (error) {
       depOut("err", ["查进度失败：" + (error && error.message ? error.message : error)]);
