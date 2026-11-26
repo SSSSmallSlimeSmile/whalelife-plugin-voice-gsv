@@ -330,7 +330,7 @@ export function renderPage(cfg: any, status: any = {}, ttsList: any[] = []): str
 
 <div class="pg-pair">
   <div class="pg-item"><div class="pg-row"><label class="pg-label" for="new_voice">音色名</label><input type="text" id="new_voice" placeholder="比如 furina"></div></div>
-  <div class="pg-item"><div class="pg-row"><label class="pg-label" for="new_ref">参考音频</label><input type="text" id="new_ref" placeholder="K:\\...\\refs\\xxx.wav"></div></div>
+  <div class="pg-item"><div class="pg-row"><label class="pg-label" for="new_ref">参考音频</label><input type="text" id="new_ref" placeholder="D:\\voice\\refs\\voice.wav"></div></div>
 </div>
 
 <div class="pg-pair">
