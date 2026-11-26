@@ -1,0 +1,996 @@
+/*! WhaleLife「嗓子」插件：GPT-SoVITS（gsv.cpp）语音合成 + 进程托管 + 念出来。
+ *
+ * 0.3.0 起把原「嘴巴」插件合进来，一个插件管五件事：
+ *   引擎启停（gsv_server.exe）· 单句合成（speak）· 文本清洗分段 + 播放（mouth_say）
+ *   网页端的「念」按钮（/plugins/voice-gsv/say）· 聊天自动念（auto_scope）
+ * 合成地址与参考音沿用原先两个插件里调好的参数，字段名跟 api_v2 一致，gsv.cpp 也认。
+ */
+import type { Context } from "../../core/context.ts";
+import { execFile, spawn } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { mkdir, writeFile, open, readdir, stat } from "node:fs/promises";
+import { createConnection } from "node:net";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { readBody, renderPage, sanitize } from "./ui.ts";
+import { probeVoices } from "./voices.ts";
+import { forSpeech, splitForSpeech, fixWavHeader, joinUrl } from "./speech.ts";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+const DEFAULTS = {
+  enabled: true,
+  /** 自动念总开关。默认关着：勾上才自动出声。 */
+  auto_read: false,
+  auto_scope: "f9",
+  url: "http://127.0.0.1:9880",
+  ref_audio: "",
+  prompt_text: "或许我也曾向往过这种力量，但那更像是一种讽刺。",
+  text_lang: "zh",
+  prompt_lang: "zh",
+  speed: 1.1,
+  voice: "",
+  voice_name: "",
+  sync_default_refer: true,
+  voices: [] as { name: string; ref_audio: string; prompt_text?: string; prompt_lang?: string }[],
+  sample_steps: 4,
+  max_chars: 110,
+  timeout_ms: 120_000,
+  out_dir: join(HERE, "data", "out"),
+  engine: "local",
+  cloud_model: "",
+  cloud_path: "/tools/tts",
+  cloud_url: "https://api.deepseek.com/v1/tools/tts",
+  cloud_key: "",
+  cloud_voice: "stella",
+  cloud_format: "wav",
+  cloud_timeout_ms: 60_000,
+  gsv: {
+    auto_start: false,
+    stop_on_exit: true,
+    exe: "",
+    args: [] as string[],
+    cwd: "",
+    host: "127.0.0.1",
+    port: 9880,
+    log: "",
+    start_wait_ms: 180_000,
+    sidecar_port: 0,
+    sidecar_exe: "",
+    sidecar_script: "",
+  },
+};
+
+type GsvConfig = typeof DEFAULTS.gsv;
+type Config = Omit<typeof DEFAULTS, "gsv"> & { gsv: GsvConfig };
+
+const safe = <A, S>(fn: (args: A, session: S) => Promise<unknown> | unknown) =>
+  async (args: A, session: S) => {
+    try {
+      return await fn(args, session);
+    } catch (error: any) {
+      return `错误：${error?.message ?? String(error)}`;
+    }
+  };
+
+/** 装了「耳朵」插件没有：它注册 ear_* 那几个工具。只给页面上「只 F9」那一档做依据。 */
+async function hasEar(tools: any): Promise<boolean> {
+  try {
+    const list = (await tools.list()) as any[];
+    return Array.isArray(list) && list.some((one) => String(one?.name ?? "").startsWith("ear_"));
+  } catch {
+    return false;
+  }
+}
+
+function replyJson(res: any, code: number, body: any) {
+  const text = JSON.stringify(body);
+  res.writeHead(code, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+  res.end(text);
+}
+
+function playFile(file: string): Promise<void> {
+  return new Promise((resolve) => {
+    execFile(
+      "powershell.exe",
+      ["-NoProfile", "-Command", `(New-Object System.Media.SoundPlayer '${file}').PlaySync()`],
+      { windowsHide: true, timeout: 180_000 },
+      () => resolve(),
+    );
+  });
+}
+
+/** 端口有没有人在听。只看 TCP 连通，不问对方是谁。 */
+function portOpen(port: number, host = "127.0.0.1", timeoutMs = 800): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = createConnection({ port, host });
+    const done = (v: boolean) => {
+      try { sock.destroy(); } catch {}
+      resolve(v);
+    };
+    sock.setTimeout(timeoutMs);
+    sock.once("connect", () => done(true));
+    sock.once("timeout", () => done(false));
+    sock.once("error", () => done(false));
+  });
+}
+
+/** 按端口找 PID。netstat 是系统自带的，不依赖 PowerShell 编码。 */
+function pidByPort(port: number): Promise<number[]> {
+  return new Promise((resolve) => {
+    execFile("netstat.exe", ["-ano", "-p", "TCP"], { windowsHide: true, timeout: 15_000 }, (err, stdout) => {
+      if (err || !stdout) return resolve([]);
+      const pids = new Set<number>();
+      for (const line of stdout.split(/\r?\n/)) {
+        const cols = line.trim().split(/\s+/);
+        if (cols.length < 5) continue;
+        if (cols[3] !== "LISTENING") continue;
+        const local = cols[1] ?? "";
+        if (!local.endsWith(`:${port}`)) continue;
+        const pid = Number(cols[4]);
+        if (Number.isInteger(pid) && pid > 0) pids.add(pid);
+      }
+      resolve([...pids]);
+    });
+  });
+}
+
+/** 文本前端（text_sidecar）的位置。引擎自己不会拉它，以前是手动起的，重启就哑。
+ *  端口：显式配置 > 引擎参数里 --sidecar 那个 > 9882
+ *  程序/脚本：显式配置 > 从 gsv_server.exe 往上找带 python\python.exe 的那层 */
+function sidecarPlan(cfg: GsvConfig) {
+  const args = Array.isArray(cfg.args) ? cfg.args : [];
+  const at = args.indexOf("--sidecar");
+  const spec = at >= 0 ? String(args[at + 1] ?? "") : "";
+  const fromSpec = Number((spec.split(":").pop() ?? "").trim()) || 0;
+  const port = Number(cfg.sidecar_port) || fromSpec || 9882;
+
+  let exe = String(cfg.sidecar_exe ?? "").trim();
+  let script = String(cfg.sidecar_script ?? "").trim();
+  if (!exe || !script) {
+    let dir = cfg.exe ? dirname(cfg.exe) : "";
+    for (let i = 0; i < 4 && dir; i += 1) {
+      const py = join(dir, "python", "python.exe");
+      const sc = join(dir, "frontend", "text_sidecar.py");
+      if (existsSync(py) && existsSync(sc)) {
+        if (!exe) exe = py;
+        if (!script) script = sc;
+        break;
+      }
+      const up = dirname(dir);
+      if (up === dir) break;
+      dir = up;
+    }
+  }
+  return { port, exe, script };
+}
+
+async function gsvStatus(cfg: GsvConfig) {
+  const open = await portOpen(cfg.port, cfg.host);
+  const pids = open ? await pidByPort(cfg.port) : [];
+  const plan = sidecarPlan(cfg);
+  const sidecarOpen = plan.port ? await portOpen(plan.port, cfg.host) : false;
+  return { open, pids, sidecar: { port: plan.port, open: sidecarOpen, ready: Boolean(plan.exe && plan.script) } };
+}
+
+/** 拉起文本前端。跟引擎是两个进程，各自独立停。 */
+async function sidecarStart(cfg: GsvConfig, logger: { info: (m: string) => void; warn: (m: string) => void }) {
+  const plan = sidecarPlan(cfg);
+  if (await portOpen(plan.port, cfg.host)) return { started: false, reason: "已经在跑了", port: plan.port };
+  if (!plan.exe || !plan.script) return { started: false, reason: "找不到文本前端的程序或脚本（设置里「文本前端」那两格）", port: plan.port };
+
+  let handle: any = null;
+  if (cfg.log) {
+    await mkdir(dirname(cfg.log), { recursive: true }).catch(() => {});
+    await writeFile(cfg.log, `[${new Date().toISOString()}] ===== text_sidecar start =====\n`, { flag: "a" }).catch(() => {});
+    handle = await open(cfg.log, "a").catch(() => null);
+  }
+  const child = spawn(plan.exe, [plan.script, "--port", String(plan.port)], {
+    cwd: dirname(plan.script),
+    windowsHide: true,
+    detached: true,
+    stdio: ["ignore", handle ? handle.fd : "ignore", handle ? handle.fd : "ignore"],
+  });
+  child.unref();
+  if (handle) await handle.close().catch(() => {});
+  logger.info(`文本前端启动中，端口 ${plan.port}，pid=${child.pid ?? "?"}`);
+  return { started: true, pid: child.pid ?? null, port: plan.port };
+}
+
+/** 拉起服务。detached，输出追加进日志，不等模型加载完。 */
+async function gsvStart(cfg: GsvConfig, logger: { info: (m: string) => void; warn: (m: string) => void }) {
+  if (await portOpen(cfg.port, cfg.host)) {
+    // 引擎活着、文本前端单独死了的情况：补起来，别当成"什么都不用做"
+    const sidecar = await sidecarStart(cfg, logger).catch((error: any) => ({
+      started: false,
+      reason: String(error?.message ?? error),
+      port: 0,
+    }));
+    return { started: false, reason: "已经在跑了", sidecar };
+  }
+  if (!cfg.exe) throw new Error("没配引擎可执行文件（设置里「引擎程序」那一格）");
+
+  let handle: any = null;
+  if (cfg.log) {
+    await mkdir(dirname(cfg.log), { recursive: true }).catch(() => {});
+    handle = await open(cfg.log, "a").catch(() => null);
+    const stamp = `[${new Date().toISOString()}] ===== whalelife start =====\n`;
+    await writeFile(cfg.log, stamp, { flag: "a" }).catch(() => {});
+  }
+
+  const child = spawn(cfg.exe, cfg.args, {
+    cwd: cfg.cwd || dirname(cfg.exe),
+    windowsHide: true,
+    detached: true,
+    stdio: ["ignore", handle ? handle.fd : "ignore", handle ? handle.fd : "ignore"],
+  });
+  child.unref();
+  if (handle) await handle.close().catch(() => {});
+  logger.info(`GSV 启动中，pid=${child.pid ?? "?"}`);
+  const sidecar = await sidecarStart(cfg, logger).catch((error: any) => ({
+    started: false,
+    reason: String(error?.message ?? error),
+    port: 0,
+  }));
+  return { started: true, pid: child.pid ?? null, sidecar };
+}
+
+/** 按端口杀。先 SIGTERM 式 taskkill，不收再 /F。 */
+function killPort(port: number) {
+  return new Promise<{ stopped: boolean; pids: number[] }>((resolve) => {
+    pidByPort(port).then((pids) => {
+      if (!pids.length) return resolve({ stopped: false, pids: [] });
+      let left = pids.length;
+      for (const pid of pids) {
+        execFile("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { windowsHide: true }, () => {
+          if (--left === 0) resolve({ stopped: true, pids });
+        });
+      }
+    });
+  });
+}
+
+/** 引擎和文本前端都停。两个端口各杀一次，主引擎先走。 */
+async function gsvStop(cfg: GsvConfig) {
+  const plan = sidecarPlan(cfg);
+  const main = await killPort(cfg.port);
+  const side = plan.port && plan.port !== cfg.port ? await killPort(plan.port) : { stopped: false, pids: [] as number[] };
+  return {
+    stopped: main.stopped || side.stopped,
+    pids: [...main.pids, ...side.pids],
+    sidecarStopped: side.stopped,
+    sidecarPids: side.pids,
+  };
+}
+
+async function waitPort(cfg: GsvConfig, ms: number) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (await portOpen(cfg.port, cfg.host)) return true;
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  return false;
+}
+
+/** 支持 ${ENV:NAME} 形式的引用，凭据本身不必写进任何配置文件 */
+function expand(value: unknown): string {
+  const raw = typeof value === "string" ? value.trim() : "";
+  const hit = /^\$\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(raw);
+  return hit ? String(process.env[hit[1]] ?? "").trim() : raw;
+}
+
+/** 云端没单独填 key 时，读主配置里 id 含 deepseek 的 provider。 */
+function mainConfigKey(): string {
+  try {
+    const file = join(HERE, "..", "..", "config", "config.json");
+    const raw = JSON.parse(readFileSync(file, "utf8"));
+    const list = Array.isArray(raw?.providers) ? raw.providers : [];
+    const found = list.find((one: any) => String(one?.id ?? "").includes("deepseek"));
+    return expand(found?.api_key);
+  } catch {
+    return "";
+  }
+}
+
+export async function apply(ctx: Context) {
+  let cfg: Config = { ...DEFAULTS } as Config;
+  let g: GsvConfig = DEFAULTS.gsv;
+  let busy = false;
+  const queue: string[] = [];
+
+  async function reload() {
+    const saved = await ctx.config.read<any>("config.json").catch(() => null);
+    const flat = saved && typeof saved === "object" ? saved : {};
+    cfg = {
+      ...DEFAULTS,
+      ...flat,
+      gsv: { ...DEFAULTS.gsv, ...((flat.gsv as Partial<GsvConfig>) ?? {}) },
+    };
+    g = cfg.gsv;
+    return cfg;
+  }
+  await reload();
+
+  function pump() {
+    if (busy) return;
+    busy = true;
+    void (async () => {
+      try {
+        while (queue.length) {
+          const next = queue.shift() as string;
+          try {
+            await speakText(next);
+          } catch (error: any) {
+            ctx.logger?.warn?.(`嗓子自动念失败：${error?.message ?? error}`);
+          }
+        }
+      } finally {
+        busy = false;
+      }
+    })();
+  }
+
+  /** 一段的第一行是不是列表项（- * + • · 或 1. 1) 1、） */
+  function startsListLine(block: string): boolean {
+    const first = block.split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? "";
+    return /^(?:[-*+•·]|\d{1,2}[.)、])(?:\s|$)/.test(first);
+  }
+
+  /**
+   * 取回复的第一段。空行分段，跳过只有代码/表格的块；开头是清单就跳过清单、念清单后面那段正文。
+   * 一段都取不到返回空串。
+   */
+  function leadParagraph(input: string): string {
+    for (const block of String(input ?? "").split(/\n\s*\n/)) {
+      let body = block;
+      if (startsListLine(block)) {
+        // 念一段清单不叫「开头第一段」，把列表行剥掉，剩下的正文才念；剥不出东西就往后找
+        body = block
+          .split(/\r?\n/)
+          .filter((line) => {
+            const t = line.trim();
+            if (!t) return false;
+            return !/^(?:[-*+•·]|\d{1,2}[.)、])(?:\s|$)/.test(t);
+          })
+          .join("\n");
+        if (!body.trim()) continue;
+      }
+      const clean = forSpeech(body).trim();
+      if (!clean) continue;
+      const meat = clean.replace(/代码略|表格略/g, "").replace(/[\s\p{P}\p{S}]/gu, "");
+      if (meat.length < 2) continue;
+      return clean;
+    }
+    return "";
+  }
+
+  function enqueue(text: string) {
+    if (queue.length >= 2) queue.shift();
+    queue.push(text);
+    pump();
+  }
+
+  /** 云端合成要的三样：地址、key、音色。配了 tts 模型就用模型配置，否则用本插件自己填的。 */
+  function cloudTarget() {
+    const engine = String(cfg.engine ?? "local").trim();
+    const id = engine.startsWith("tts:")
+      ? engine.slice(4).trim()
+      : String(cfg.cloud_model ?? "").trim();
+    if (id) {
+      const link = ctx.models.connection(id);
+      const key = expand(link.api_key);
+      if (!key) throw new Error(`模型配置「${link.name}」里没有可用的 key`);
+      return {
+        url: joinUrl(link.base_url, String(cfg.cloud_path || "/tools/tts")),
+        key,
+        voice: String(cfg.cloud_voice || "stella"),
+        where: `模型配置「${link.name}」`,
+      };
+    }
+    const key = expand(cfg.cloud_key) || mainConfigKey();
+    if (!key) {
+      throw new Error("没选 tts 模型，本插件也没填云端 Key，主配置里也找不到 deepseek 的 provider");
+    }
+    return {
+      url: String(cfg.cloud_url || "https://api.deepseek.com/v1/tools/tts"),
+      key,
+      voice: String(cfg.cloud_voice || "stella"),
+      where: "本插件自己填的地址",
+    };
+  }
+
+  async function synthCloud(text: string) {
+    const target = cloudTarget();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Number(cfg.cloud_timeout_ms) || 60_000);
+    try {
+      const res = await fetch(target.url, {
+        method: "POST",
+        headers: { Authorization: "Bearer " + target.key, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text,
+          voice_id: target.voice,
+          format: String(cfg.cloud_format || "wav"),
+          filter_markdown: true,
+        }),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        throw new Error(`云端合成失败 HTTP ${res.status}：${detail.slice(0, 160)}`);
+      }
+      const raw = Buffer.from(await res.arrayBuffer());
+      if (raw.length < 1000) throw new Error("云端返回的音频太小，可能合成失败");
+      return fixWavHeader(raw);
+    } catch (error: any) {
+      if (controller.signal.aborted) throw new Error("云端合成超时");
+      if (typeof error?.message === "string" && error.message.startsWith("云端")) throw error;
+      throw new Error(`连不上云端合成（${target.url}）：${error?.message ?? error}`);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** 按名字取一套参考音；没配名字或名字对不上，就退回顶层那对 ref_audio / prompt_text。 */
+  function resolveVoice(source: any, want?: string) {
+    const list: any[] = Array.isArray(source?.voices) ? source.voices : [];
+    const name = String(want ?? source?.voice_name ?? "").trim();
+    const hit = name ? list.find((one) => one && String(one.name || "") === name) : undefined;
+    if (hit && String(hit.ref_audio || "")) {
+      return {
+        name: String(hit.name || ""),
+        ref_audio: String(hit.ref_audio),
+        prompt_text: String(hit.prompt_text ?? ""),
+        prompt_lang: String(hit.prompt_lang || source?.prompt_lang || "zh"),
+      };
+    }
+    // 显式点名某个音色但库里没有 → 报错，别静默用别的嗓子
+    const asked = String(want ?? "").trim();
+    if (asked) {
+      const names = list.map((one) => String(one?.name || "")).filter(Boolean);
+      throw new Error(`没有这个音色：${asked}。现有音色：${names.length ? names.join("、") : "（空）"}`);
+    }
+    return {
+      name: "",
+      ref_audio: String(source?.ref_audio || ""),
+      prompt_text: String(source?.prompt_text || ""),
+      prompt_lang: String(source?.prompt_lang || "zh"),
+    };
+  }
+
+  /**
+   * 配置里点名的音色，库里查不到。
+   * 不报错——配置过期不该让整条语音全废——但要说出来，不能悄悄用别的嗓子。
+   */
+  function staleVoice(source: any): string {
+    const name = String(source?.voice_name || "").trim();
+    if (!name) return "";
+    const list: any[] = Array.isArray(source?.voices) ? source.voices : [];
+    const hit = list.find((one) => one && String(one.name || "") === name && String(one.ref_audio || ""));
+    if (hit) return "";
+    const names = list.map((one) => String(one?.name || "")).filter(Boolean);
+    return `配置里的音色「${name}」不在库里，现在用的是顶层那对参考音。库里有：${names.length ? names.join("、") : "（空）"}。`;
+  }
+
+  /** 引擎记住的默认参考音。gsv.cpp 重启后是空的，所以这份只在同一个引擎进程期间可信。 */
+  let referSync: { ok: boolean; at: number; key: string; error: string } = { ok: false, at: 0, key: "", error: "" };
+  const REFER_RETRY_MS = 60_000;
+
+  /**
+   * 把当前音色设成引擎的默认参考音。设过之后 /tts 可以不带 ref_audio_path 与 prompt_text，
+   * 少两个每轮都要逐字对上的字段（写错一个字音色就飘）。
+   */
+  async function syncRefer(force = false): Promise<boolean> {
+    if (String(cfg.engine || "local") !== "local") return referSync.ok;
+    if (cfg.sync_default_refer === false) return referSync.ok;
+    const picked = resolveVoice(cfg);
+    if (!picked.ref_audio) return referSync.ok;
+    const key = `${picked.ref_audio}|${picked.prompt_text}`;
+    if (!force && referSync.key === key && Date.now() - referSync.at < REFER_RETRY_MS) return referSync.ok;
+    try {
+      const res = await fetch(`${cfg.url}/change_refer`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          refer_wav_path: picked.ref_audio,
+          prompt_text: picked.prompt_text,
+          prompt_lang: picked.prompt_lang,
+        }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status} ${detail.slice(0, 80)}`.trim());
+      }
+      referSync = { ok: true, at: Date.now(), key, error: "" };
+      ctx.logger?.info?.(`默认音色已同步到引擎：${picked.name || picked.ref_audio}`);
+    } catch (error: any) {
+      referSync = { ok: false, at: Date.now(), key, error: String(error?.message ?? error) };
+      ctx.logger?.warn?.(`默认音色没同步上：${referSync.error}`);
+    }
+    return referSync.ok;
+  }
+
+  async function synth(text: string, speedOverride?: number, voiceName?: string): Promise<Buffer> {
+    if (String(cfg.engine || "local") !== "local") return synthCloud(text);
+    // POST JSON：整段文本不进 URL。gsv.cpp 只收 JSON 体，不收 form（实测 form 报 bad json）。
+    const picked = resolveVoice(cfg, voiceName);
+    if (!picked.ref_audio) throw new Error("没配参考音频，念不了");
+    const base: Record<string, unknown> = {
+      text,
+      text_lang: cfg.text_lang,
+      text_split_method: "cut5",
+      media_type: "wav",
+      speed_factor: Number(speedOverride ?? cfg.speed),
+      ...(String(cfg.voice || "").trim() ? { voice: String(cfg.voice).trim() } : {}),
+      ...(Number(cfg.sample_steps) > 0 ? { sample_steps: Number(cfg.sample_steps) } : {}),
+    };
+    const withRef = {
+      ref_audio_path: picked.ref_audio,
+      prompt_lang: picked.prompt_lang,
+      prompt_text: picked.prompt_text,
+    };
+    const pickedKey = `${picked.ref_audio}|${picked.prompt_text}`;
+    const omitRef = cfg.sync_default_refer !== false && referSync.ok && referSync.key === pickedKey;
+    ctx.logger?.info?.(`合成：${omitRef ? "引擎已记默认音色，不带参考音字段" : "带参考音字段"}`);
+    try {
+      return await postTts({ ...base, ...(omitRef ? {} : withRef) });
+    } catch (error: any) {
+      if (!omitRef) throw error;
+      // 引擎可能重启过，默认参考音跟着丢了。清掉标记，带上字段重打一次，顺手补一次同步。
+      referSync = { ok: false, at: 0, key: "", error: "引擎可能重启过，默认音色丢了" };
+      ctx.logger?.warn?.(`引擎没记住默认音色（${error?.message ?? error}），这一句改带参考音重打`);
+      const buf = await postTts({ ...base, ...withRef });
+      void syncRefer(true).catch(() => false);
+      return buf;
+    }
+  }
+
+  /** 真发一次 /tts，回音频字节。错误按类型翻成人话。 */
+  async function postTts(payload: Record<string, unknown>): Promise<Buffer> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Number(cfg.timeout_ms) || 120_000);
+    try {
+      const res = await fetch(`${cfg.url}/tts`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        throw new Error(`语音合成失败 HTTP ${res.status}：${detail.slice(0, 120)}`);
+      }
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.length < 1000) throw new Error("返回的音频太小，可能合成失败");
+      return buf;
+    } catch (error: any) {
+      if (controller.signal.aborted) throw new Error("语音合成超时");
+      if (typeof error?.message === "string" && error.message.startsWith("语音合成失败")) throw error;
+      if (typeof error?.message === "string" && error.message.includes("音频太小")) throw error;
+      throw new Error(`连不上 GPT-SoVITS（${cfg.url}）：${error?.message ?? error}`);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function saveWav(buf: Buffer): Promise<string> {
+    await mkdir(cfg.out_dir, { recursive: true });
+    const file = join(cfg.out_dir, `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.wav`);
+    await writeFile(file, buf);
+    return file;
+  }
+
+  /** 单句：合成一段，落盘，可选播放。 */
+  async function speakOne(text: string, wantPlay: boolean, speed?: number, voiceName?: string) {
+    if (String(cfg.engine || "local") === "local" && !resolveVoice(cfg, voiceName).ref_audio) throw new Error("没配参考音频，念不了");
+    if (String(cfg.engine || "local") === "local" && !(await portOpen(g.port, g.host))) {
+      throw new Error(`GPT-SoVITS 没在跑（${g.host}:${g.port}）。用 gsv_start 起它。`);
+    }
+    if (String(cfg.engine || "local") === "local" && cfg.sync_default_refer !== false && !referSync.ok) {
+      await syncRefer().catch(() => false);
+    }
+    const buf = await synth(text, speed, voiceName);
+    const file = await saveWav(buf);
+    if (wantPlay) await playFile(file).catch(() => {});
+    return file;
+  }
+
+  /** 长文：清洗、分段、逐段合成播放。 */
+  async function speakText(rawText: string) {
+    await reload();
+    const engine = String(cfg.engine || "local");
+    if (engine === "local" && !resolveVoice(cfg).ref_audio) throw new Error("没配参考音频，念不了");
+    const clean = forSpeech(rawText);
+    if (!clean) throw new Error("这段话过滤后没什么可念的");
+    // 只在「清洗后只剩代码/表格占位」时才拒念。原来的门槛是剩余字数 < 6，
+    // 结果「嗓子合好了。」这种五个字的短句也被当成空话挡掉了。
+    const meat = clean.replace(/代码略|表格略/g, "").replace(/[，。！？；、\s]/g, "");
+    if (meat.length < 2 && /代码略|表格略/.test(clean)) throw new Error("这段只有代码和表格，没什么可念的");
+    const parts = splitForSpeech(clean, Number(cfg.max_chars) || 110);
+    await mkdir(cfg.out_dir, { recursive: true });
+    const started = Date.now();
+    for (const part of parts) {
+      const buf = await synth(part);
+      await playFile(await saveWav(buf));
+    }
+    return {
+      ok: true,
+      segments: parts.length,
+      chars: clean.length,
+      ms: Date.now() - started,
+      preview: clean.slice(0, 60),
+    };
+  }
+
+  // ── 工具 ──────────────────────────────────────────────
+  ctx.tools.register({
+    name: "speak",
+    description:
+      "把一段话合成为语音。play 为 true 时同时在本机音箱播放。返回一个 [[voice:路径]] 标记，把标记原样写进回复，页面上会出现播放器。",
+    schema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "要念的话，200 字以内" },
+        play: { type: "boolean", description: "是否立即播放，默认 true" },
+        speed: { type: "number", description: "语速倍率，默认按配置" },
+        voice: { type: "string", description: "音色名（设置页里那套参考音的名字）。不填就用当前音色" },
+      },
+      required: ["text"],
+    },
+    danger: "ask",
+    run: safe(async (args: any) => {
+      await reload();
+      const text = String(args?.text ?? "").trim().slice(0, 200);
+      if (!text) throw new Error("text 不能为空");
+      const wantPlay = args?.play !== false;
+      const file = await speakOne(text, wantPlay, args?.speed, args?.voice);
+      const warn = staleVoice(cfg);
+      return `${wantPlay ? "已播放" : "已生成"}：${text.slice(0, 40)}${text.length > 40 ? "…" : ""}\n把下面这行原样放进回复就能在页面里播放：\n[[voice:${file}]]${warn ? "\n注意：" + warn : ""}`;
+    }),
+  });
+
+  // 给耳朵插件调用的入口：耳朵说完话拿到回复，交到这里念出来。
+  // "F9 说完自动念"这件事归耳朵，念的实现归嗓子，两个插件各管一段。
+  ctx.tools.register({
+    name: "mouth_say",
+    description:
+      "把一段文字念出来：自动去掉代码块、表格、图片标记、链接和文件路径，长文按句子分段播放。由耳朵插件在拿到回复后调用。",
+    schema: {
+      type: "object",
+      properties: { text: { type: "string", description: "要念的内容" } },
+      required: ["text"],
+    },
+    danger: "safe",
+    run: async (args: any) => {
+      await reload();
+      const text = String(args?.text ?? "").trim();
+      if (!text) return "没做：没有文本。";
+      if (!cfg.enabled) return "嗓子的「念出来」是关着的，没出声。";
+      enqueue(text);
+      return "已交给嗓子念。";
+    },
+  });
+
+  ctx.tools.register({
+    name: "gsv_status",
+    description: "查语音服务在不在：端口通不通、占用端口的 PID 是哪些。",
+    schema: { type: "object", properties: {} },
+    danger: "safe",
+    run: async () => {
+      await reload();
+      const s = await gsvStatus(g);
+      const sc = s.sidecar.open ? "在跑" : s.sidecar.ready ? "没起" : "没配";
+      if (!s.open) return `未在运行（${g.host}:${g.port} 连不上）；文本前端${sc}（端口 ${s.sidecar.port}）`;
+      return `在运行（${g.host}:${g.port}），PID：${s.pids.join(", ") || "查不到"}；文本前端${sc}（端口 ${s.sidecar.port}）`;
+    },
+  });
+
+  ctx.tools.register({
+    name: "gsv_start",
+    description:
+      "按配置拉起语音服务（gsv_server.exe），默认不等模型加载完就返回。wait 为 true 时等到端口通，最多 3 分钟。",
+    schema: {
+      type: "object",
+      properties: { wait: { type: "boolean", description: "是否等到端口可用，默认 false" } },
+    },
+    danger: "ask",
+    run: safe(async (args: any) => {
+      await reload();
+      const r = await gsvStart(g, { info: (m) => ctx.logger.info(m), warn: (m) => ctx.logger.warn(m) });
+      if (!r.started) {
+        const sc: any = (r as any).sidecar;
+        if (sc?.started) return `引擎本来就在跑（${g.host}:${g.port}）；文本前端刚才没在，已经补起（端口 ${sc.port}）。`;
+        return `没做：${r.reason}${sc && sc.reason ? `（文本前端：${sc.reason}）` : ""}`;
+      }
+      const scNote = r.sidecar?.started ? `，文本前端也起了（端口 ${r.sidecar.port}）` : `，文本前端没起：${r.sidecar?.reason ?? "未知"}（它不在，英文和多语种会 500）`;
+      if (args?.wait !== true) return `已拉起（pid=${r.pid ?? "?"}）${scNote}，模型加载要几十秒，用 gsv_status 看。`;
+      const up = await waitPort(g, g.start_wait_ms);
+      if (!up) return `已拉起，但 3 分钟内端口还没通，看日志 ${g.log}`;
+      const synced = await syncRefer(true);
+      return `已就绪（${g.host}:${g.port}）${synced ? "，默认音色已同步" : referSync.error ? `，默认音色没同步上：${referSync.error}` : ""}`;
+    }),
+  });
+
+  ctx.tools.register({
+    name: "gsv_stop",
+    description: "按端口找 PID 并结束语音服务进程（连子进程一起）。",
+    schema: { type: "object", properties: {} },
+    danger: "ask",
+    run: async () => {
+      await reload();
+      const r = await gsvStop(g);
+      referSync = { ok: false, at: 0, key: "", error: "引擎已停" };
+      if (!r.stopped) return `端口 ${g.port} 上没有进程，没什么可停的`;
+      return `已结束：${r.pids.join(", ")}`;
+    },
+  });
+
+  // ── 网页 ──────────────────────────────────────────────
+  ctx.web.page(
+    "/plugins/voice-gsv/",
+    async (_req: any, res: any) => {
+      await reload();
+      const status = { ...(await gsvStatus(g)), host: g.host, port: g.port, earInstalled: await hasEar(ctx.tools) };
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+      res.end(renderPage(cfg, status, ctx.models.list("tts")));
+    },
+    { title: "嗓子", navigation: true },
+  );
+
+  ctx.web.api("/plugins/voice-gsv/status", async (_req: any, res: any) => {
+    try {
+      await reload();
+      const s = await gsvStatus(g);
+      return replyJson(res, 200, {
+        ok: true,
+        status: { ...s, host: g.host, port: g.port },
+        referSync: { ok: referSync.ok, at: referSync.at, error: referSync.error },
+        voiceWarning: staleVoice(cfg),
+      });
+    } catch (error: any) {
+      return replyJson(res, 500, { ok: false, error: error?.message ?? String(error) });
+    }
+  });
+
+  ctx.web.api("/plugins/voice-gsv/start", async (_req: any, res: any) => {
+    try {
+      await reload();
+      const r = await gsvStart(g, { info: (m) => ctx.logger.info(m), warn: (m) => ctx.logger.warn(m) });
+      return replyJson(res, 200, {
+        ok: true,
+        started: r.started,
+        message: r.started
+          ? `已发出启动命令（pid=${r.pid ?? "?"}）。模型加载要几十秒，稍后刷新状态。日志：${g.log}`
+          : `没有启动：${r.reason}`,
+      });
+    } catch (error: any) {
+      return replyJson(res, 500, { ok: false, error: error?.message ?? String(error) });
+    }
+  });
+
+  ctx.web.api("/plugins/voice-gsv/stop", async (_req: any, res: any) => {
+    try {
+      await reload();
+      const r = await gsvStop(g);
+      referSync = { ok: false, at: 0, key: "", error: "引擎已停" };
+      return replyJson(res, 200, {
+        ok: true,
+        stopped: r.stopped,
+        message: r.stopped ? `已结束：${r.pids.join(", ")}` : `端口 ${g.port} 上没有进程`,
+      });
+    } catch (error: any) {
+      return replyJson(res, 500, { ok: false, error: error?.message ?? String(error) });
+    }
+  });
+
+  // 把当前音色设成引擎的默认参考音。引擎重启后要重设一次；正常由 speakOne / gsv_start 自动做。
+  ctx.web.api("/plugins/voice-gsv/sync-refer", async (_req: any, res: any) => {
+    try {
+      await reload();
+      const synced = await syncRefer(true);
+      return replyJson(res, 200, {
+        ok: true,
+        synced,
+        referSync: { ok: referSync.ok, at: referSync.at, error: referSync.error },
+      });
+    } catch (error: any) {
+      return replyJson(res, 500, { ok: false, error: error?.message ?? String(error) });
+    }
+  });
+
+  const sayHandler = async (req: any, res: any) => {
+    try {
+      const body = await readBody(req);
+      const text = String(body?.text ?? "").trim();
+      if (!text) return replyJson(res, 400, { ok: false, error: "没有要念的文字" });
+      if (busy || queue.length) {
+        ctx.logger?.warn?.("念话请求", { status: "busy", chars: text.length });
+        return replyJson(res, 409, { ok: false, error: "上一段还在念，等它念完" });
+      }
+      busy = true;
+      try {
+        ctx.logger?.info?.("念话请求", { status: "start", chars: text.length, preview: text.slice(0, 40) });
+        const r = await speakText(text);
+        ctx.logger?.info?.("念话请求", { status: "ok", chars: r.chars, segments: r.segments, ms: r.ms });
+        return replyJson(res, 200, r);
+      } finally {
+        busy = false;
+      }
+    } catch (error: any) {
+      busy = false;
+      ctx.logger?.warn?.("念话请求", { status: "fail", error: String(error?.message ?? error) });
+      return replyJson(res, 500, { ok: false, error: error?.message ?? String(error) });
+    }
+  };
+  // 宿主只允许本插件 id 下的路由，所以没法保留旧的 /plugins/mouth/say 别名；
+  // 聊天页那颗「念」按钮已经跟着改成打这一条。
+  ctx.web.api("/plugins/voice-gsv/say", sayHandler);
+
+  ctx.web.api("/plugins/voice-gsv/test", async (_req: any, res: any) => {
+    try {
+      if (busy || queue.length) return replyJson(res, 409, { ok: false, error: "上一段还在念，等它念完" });
+      busy = true;
+      try {
+        await reload();
+        const r = await speakText("嗓子通了，我是勘。这句话是用来试音色的。");
+        return replyJson(res, 200, { ...r, text: `念完了：${r.segments} 段，${r.chars} 字，用时 ${(r.ms / 1000).toFixed(1)} 秒。` });
+      } finally {
+        busy = false;
+      }
+    } catch (error: any) {
+      busy = false;
+      return replyJson(res, 500, { ok: false, error: error?.message ?? String(error) });
+    }
+  });
+
+  ctx.web.api("/plugins/voice-gsv/save", async (req: any, res: any) => {
+    try {
+      const { top, gsv } = sanitize(await readBody(req));
+      if (!Object.keys(top).length && !Object.keys(gsv).length) throw new Error("没有可保存的字段");
+      const saved: any = (await ctx.config.read<any>("config.json").catch(() => null)) ?? {};
+      const merged: any = { ...saved, ...top };
+      if (Object.keys(gsv).length) merged.gsv = { ...((saved?.gsv as any) ?? {}), ...gsv };
+      await ctx.config.save("config.json", merged);
+      await reload();
+      return replyJson(res, 200, { ok: true, saved: [...Object.keys(top), ...Object.keys(gsv).map((k) => "gsv." + k)] });
+    } catch (error: any) {
+      return replyJson(res, 400, { ok: false, error: error?.message ?? String(error) });
+    }
+  });
+
+  ctx.web.api("/plugins/voice-gsv/voices", async (_req: any, res: any) => {
+    try {
+      await reload();
+      const found = await probeVoices(cfg, mainConfigKey());
+      return replyJson(res, 200, { ok: true, ...found });
+    } catch (error: any) {
+      return replyJson(res, 500, { ok: false, error: error?.message ?? String(error) });
+    }
+  });
+
+  // 参考音目录里的 wav：给页面挑音色用。只读，不落盘。
+  ctx.web.api("/plugins/voice-gsv/refs", async (_req: any, res: any) => {
+    try {
+      await reload();
+      const argsList: string[] = Array.isArray(g.args) ? g.args : [];
+      const dirs: string[] = [];
+      for (let i = 0; i < argsList.length - 1; i += 1) {
+        if (argsList[i] === "--allow-path" && argsList[i + 1]) dirs.push(argsList[i + 1]);
+      }
+      if (cfg.ref_audio) dirs.unshift(dirname(cfg.ref_audio));
+      const known: any[] = Array.isArray(cfg.voices) ? (cfg.voices as any[]) : [];
+      const used = new Set<string>();
+      const items: any[] = [];
+      for (const dir of dirs) {
+        if (!dir || used.has(dir)) continue;
+        used.add(dir);
+        const files = await readdir(dir).catch(() => [] as string[]);
+        for (const name of files.sort()) {
+          if (!/.wav$/i.test(name)) continue;
+          const path = join(dir, name);
+          const info = await stat(path).catch(() => null);
+          if (!info || !info.isFile()) continue;
+          items.push({
+            name,
+            path,
+            bytes: info.size,
+            registered: known.some((one) => one && String(one.ref_audio || "") === path),
+          });
+        }
+      }
+      return replyJson(res, 200, {
+        ok: true,
+        dirs: dirs.filter((one, at) => dirs.indexOf(one) === at),
+        items,
+        voices: known.map((one) => ({ name: one?.name ?? "", ref_audio: one?.ref_audio ?? "", prompt_text: one?.prompt_text ?? "", prompt_lang: one?.prompt_lang ?? "" })),
+        current: String(cfg.voice_name || ""),
+      });
+    } catch (error: any) {
+      return replyJson(res, 500, { ok: false, error: error?.message ?? String(error) });
+    }
+  });
+
+  // 问引擎：现在认识哪几个模型包（音色名）。只读，不动配置。
+  ctx.web.api("/plugins/voice-gsv/engine-models", async (_req: any, res: any) => {
+    try {
+      await reload();
+      const base = joinUrl(String(cfg.url || ""), "/models");
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 6000);
+      const started = Date.now();
+      let body: any;
+      try {
+        const answer = await fetch(base, { signal: ctrl.signal });
+        if (!answer.ok) throw new Error(`引擎回了 HTTP ${answer.status}`);
+        body = await answer.json();
+      } finally {
+        clearTimeout(timer);
+      }
+      const list: any[] = Array.isArray(body?.voices) ? body.voices : [];
+      return replyJson(res, 200, {
+        ok: true,
+        elapsedMs: Date.now() - started,
+        current: String(body?.current ?? ""),
+        configured: String(cfg.voice || ""),
+        modelsDir: String(body?.models_dir ?? ""),
+        names: list.map((one) => ({
+          name: String(one?.name ?? ""),
+          complete: Boolean(String(one?.ar || "") && String(one?.cond || "") && String(one?.dit || "")),
+        })),
+      });
+    } catch (error: any) {
+      const msg = error?.name === "AbortError" ? "引擎 6 秒没回话，可能没起或者卡住了。" : error?.message ?? String(error);
+      return replyJson(res, 200, { ok: false, error: msg });
+    }
+  });
+
+  // ── 伴随行为 ──────────────────────────────────────────
+  // 网页里打字也念。F9 那几轮由耳朵调 mouth_say，这里跳过，免得念两遍。
+  ctx.on("channel/reply", async (ev: any) => {
+    try {
+      if (ev?.role !== "assistant") return;
+      if (ev?.origin?.platform === "ear") return;
+      await reload();
+      if (!cfg.enabled) return;
+      // 自动念默认关着：勾了才出声，网页里的回复才念。
+      if (!cfg.auto_read) return;
+      // 「只 F9」这一档网页不念：那几轮由耳朵调 mouth_say 念，这里再念就重复了。
+      const scope = String(cfg.auto_scope || "f9");
+      if (scope !== "all" && scope !== "lead") return;
+      // 「只念开头」那一档：截到第一段，长回复不至于念上好几分钟。
+      const raw = String(ev?.text ?? "");
+      const text = scope === "lead" ? leadParagraph(raw) : raw.trim();
+      if (!text) return;
+      enqueue(text);
+    } catch (error: any) {
+      ctx.logger?.warn?.(`嗓子：这一句没念成，${error?.message ?? String(error)}`);
+    }
+  });
+
+  // 伴随 WhaleLife 启动：只补缺，不重复拉起。默认关着，手动点。
+  ctx.on("whalelife/ready", async () => {
+    await reload();
+    if (!g.auto_start) return;
+    if (await portOpen(g.port, g.host)) {
+      ctx.logger.info(`GSV 已在运行，不重复拉起（${g.host}:${g.port}）`);
+      return;
+    }
+    const r = await gsvStart(g, { info: (m) => ctx.logger.info(m), warn: (m) => ctx.logger.warn(m) }).catch((error: any) => ({
+      started: false,
+      reason: error?.message ?? String(error),
+    }));
+    ctx.logger.info(r.started ? `GSV 已随主程序拉起（pid=${(r as any).pid ?? "?"}）` : `GSV 未拉起：${(r as any).reason ?? "?"}`);
+  });
+
+  if (g.stop_on_exit) {
+    ctx.on("whalelife/shutdown", async () => {
+      const r = await gsvStop(g);
+      ctx.logger.info(r.stopped ? `GSV 已随主程序结束：${r.pids.join(", ")}` : "GSV 本来就停着");
+    });
+  }
+
+  ctx.logger?.info?.(
+    `嗓子就绪（引擎 ${String(cfg.engine || "local") === "local" ? "本地 " + cfg.url : "云端 " + cfg.cloud_voice}，自动念 ${cfg.auto_read ? (cfg.auto_scope === "all" ? "全部" : cfg.auto_scope === "lead" ? "只念开头" : "只 F9") : "关"}）`,
+  );
+}

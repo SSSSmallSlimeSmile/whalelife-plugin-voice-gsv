@@ -1,0 +1,5 @@
+id: voice-gsv
+name: 嗓子 · GSV
+description: 语音一套管完：gsv.cpp 引擎启停 + 合成 + 念出来（清洗分段、自动念、聊天页「念」按钮）
+version: 0.4.2
+apiVersion: "1"
