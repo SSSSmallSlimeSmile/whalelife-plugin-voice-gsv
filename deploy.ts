@@ -252,12 +252,20 @@ export function pickZipShape(rawNames: string[]): ZipShape | null {
   return null;
 }
 
-/** 把 src 下的东西并进 dest：同名覆盖，dest 里多出来的（音色、自己放的模型）一律不动。 */
-async function mergeMove(src: string, dest: string) {
+type MergeOp =
+  | { kind: "added"; path: string }
+  | { kind: "replaced"; backup: string; path: string };
+
+/**
+ * 把 src 下的东西并进 dest：同名覆盖，dest 里多出来的（音色、自己放的模型）一律不动。
+ * 每一次写盘都记进 ops，中途失败由 rollbackMerge 逆向还原——包括被替换掉的同名文件。
+ */
+async function mergeMove(src: string, dest: string, backupDir: string, ops: MergeOp[], rel = "") {
   await mkdir(dest, { recursive: true });
   for (const name of await readdir(src)) {
     const from = join(src, name);
     const to = join(dest, name);
+    const relPath = rel ? join(rel, name) : name;
     const sf = await stat(from);
     let dt;
     try {
@@ -266,14 +274,40 @@ async function mergeMove(src: string, dest: string) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
     if (sf.isDirectory() && dt?.isDirectory()) {
-      await mergeMove(from, to);
+      await mergeMove(from, to, backupDir, ops, relPath);
       continue;
     }
     if (dt && sf.isDirectory() !== dt.isDirectory()) {
       throw new Error(`无法覆盖：ZIP 条目与目标的文件/目录类型不同：${to}`);
     }
+    if (dt) {
+      const backup = join(backupDir, relPath);
+      await mkdir(dirname(backup), { recursive: true });
+      await rename(to, backup);
+      ops.push({ kind: "replaced", backup, path: to });
+    } else {
+      ops.push({ kind: "added", path: to });
+    }
     await rename(from, to);
   }
+}
+
+/** 逆序还原：覆盖过的把原来那份搬回去，新建的删掉。返回没能还原的条目。 */
+async function rollbackMerge(ops: MergeOp[]): Promise<string[]> {
+  const failed: string[] = [];
+  for (const op of [...ops].reverse()) {
+    try {
+      if (op.kind === "added") {
+        await rm(op.path, { recursive: true, force: true });
+      } else {
+        await rm(op.path, { force: true, recursive: true });
+        await rename(op.backup, op.path);
+      }
+    } catch (error) {
+      failed.push(`${op.path}：${String(error)}`);
+    }
+  }
+  return failed;
 }
 
 export type InstallRequest = {
@@ -340,6 +374,10 @@ export function startInstall(req: InstallRequest) {
         // 解到独占的同级临时目录，验完锚点再合并。合并失败可能留下已写入的文件。
         await mkdir(dirname(root), { recursive: true });
         const staging = await mkdtemp(join(dirname(root), ".voice-gsv-incoming-"));
+        // 同名覆盖前先把原来那份挪进备份目录；整次合并失败就逆序还原。
+        const backupDir = await mkdtemp(join(dirname(root), ".voice-gsv-backup-"));
+        const ops: MergeOp[] = [];
+        let merged = false;
         try {
           await extractZip(zip, staging);
           const real = join(staging, shape.strip);
@@ -349,17 +387,34 @@ export function startInstall(req: InstallRequest) {
           } catch (error) {
             throw new Error(`包解开了，但引擎文件不可用：${anchor}。目标目录没动过。原因：${String(error)}`);
           }
-          await mergeMove(real, target);
+          await mergeMove(real, target, backupDir, ops);
+          merged = true;
         } finally {
           await rm(staging, { recursive: true, force: true }).catch((error) => {
             cur.cleanupWarning = `临时目录清理失败：${staging}。原因：${String(error)}`;
           });
+          if (merged || ops.length === 0) {
+            await rm(backupDir, { recursive: true, force: true }).catch((error) => {
+              cur.cleanupWarning = `备份目录清理失败：${backupDir}。原因：${String(error)}`;
+            });
+          } else {
+            const missed = await rollbackMerge(ops);
+            if (missed.length === 0) {
+              (cur as any).rollbackNote = `已还原 ${ops.length} 处写盘（新增的删掉、覆盖的搬回）。`;
+              await rm(backupDir, { recursive: true, force: true }).catch(() => {});
+            } else {
+              (cur as any).rollbackNote = `还原 ${ops.length - missed.length}/${ops.length} 处，以下没能还原：${missed.join("；")}。原文件备份在 ${backupDir}`;
+              (cur as any).backupDir = backupDir;
+            }
+          }
         }
       }
       cur.phase = "done";
     } catch (error: any) {
       cur.phase = "failed";
       cur.error = error?.message ?? String(error);
+      const note = (cur as any).rollbackNote;
+      if (note) cur.error = `${cur.error}（${note}）`;
     }
   })();
   return { id, root, into };
