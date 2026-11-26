@@ -272,6 +272,7 @@ export function renderPage(cfg: any, status: any = {}, ttsList: any[] = []): str
     <button class="pg-tab on" type="button" data-pg="pg-say">念出来</button>
     <button class="pg-tab" type="button" data-pg="pg-voice">音色</button>
     <button class="pg-tab" type="button" data-pg="pg-engine">引擎</button>
+<button class="pg-tab" type="button" data-pg="pg-deploy">部署</button>
     <button class="pg-tab" type="button" data-pg="pg-cloud">云端</button>
   </div>
   <div class="pg-actions"><button class="btn primary" type="button" id="save">保存</button></div>
@@ -372,27 +373,50 @@ export function renderPage(cfg: any, status: any = {}, ttsList: any[] = []): str
   <div class="pg-item"><div class="pg-row"><label class="pg-label" for="start_wait_ms">等待就绪上限（毫秒）</label><input type="number" id="start_wait_ms" step="1000" min="10000" max="600000" value="${esc(g.start_wait_ms)}"><p class="pg-hint">只在需要「等它真起来」时用，默认 180 秒。</p></div></div>
 </div>
 
-<p class="pg-sub">部署（换台机器、或给别人装的时候用）</p>
 
+</section>
+
+<section class="pg-pg" id="pg-deploy" hidden>
+<p class="pg-tip">这一页只在「换台机器、或者给别人装」时用。<b>本机已经能念话的话，这一页可以整页不管</b>——十五项全绿就是好的，一个字都不用填。</p>
+
+<p class="pg-sub">先看自己属于哪种</p>
 <div class="pg-item">
-  <p class="pg-label">① 拿到包</p>
-  <p class="pg-hint"><a id="dep_dl_engine" href="${ENGINE_ASSET.url}" target="_blank" rel="noreferrer">引擎包（14.4 MB）</a> · <a id="dep_dl_page" href="${ENGINE_RELEASES}" target="_blank" rel="noreferrer">发布页</a> —— 这一份只有 exe 和三个 ggml dll，解到 &lt;根目录&gt;\runtime\gsv，sidecar、python、模型都不在里面。</p>
-  <p class="pg-hint">完整包 3.16 GB（exe + sidecar + 内嵌 python + 七件模型，解开正好是 runtime\ 那一层）不在 GitHub，插件下不了——自己去整合包或网盘拿，路径填在下面 ③。</p>
+<p class="pg-hint"><b>① 本机已有引擎（现在这种）</b>：点下面 ② 的「检查缺什么」，十五项全绿就完事了，不用装、不用改配置。<br>
+<b>② 换台机器 / 自己重装</b>：手上有那个 3.16 GB 的完整包，走 ③ 填路径 →「看一下这个包」→「从本地包安装」。<br>
+<b>③ 手上什么都没有</b>：只能拿到 14 MB 那个引擎包，里面只有 gsv_server.exe 和两个 ggml dll，sidecar、内嵌 python、七件模型一概没有——等于装了一半。这条现在没有一键全套，别指望。</p>
 </div>
 
+<p class="pg-sub">① 拿到包</p>
 <div class="pg-item">
-  <p class="pg-label">② 解包根目录</p>
-  <div class="pg-row"><label class="pg-label" for="dep_root">根目录</label><input type="text" id="dep_root" placeholder="...\GSV（它下面应该是 runtime\gsv\gsv_server.exe）"><p class="pg-hint">留空就从上面的「引擎程序」往上推三级。「检查」只读——不下载、不写盘、不改配置。</p></div>
+<p class="pg-hint"><a id="dep_dl_engine" href="${ENGINE_ASSET.url}" target="_blank" rel="noreferrer">引擎包（14.4 MB）</a> · <a id="dep_dl_page" href="${ENGINE_RELEASES}" target="_blank" rel="noreferrer">发布页</a> —— 解到 &lt;根目录&gt;\\runtime\\gsv 那一层。包里只有 exe 加两个 ggml dll，缺模型会起不来，日志里会写找不到哪个 gguf。</p>
+<p class="pg-hint">完整包 3.16 GB（exe + sidecar + 内嵌 python + 七件模型，解开正好是 runtime\\ 这一层）不在 GitHub，插件下不了——自己去整合包或网盘拿，路径填在 ③。</p>
+<p class="pg-hint">两个链接都只在新标签页打开，插件不替你下、不替你存。</p>
+</div>
+
+<p class="pg-sub">② 解包根目录（先检查，缺什么补什么）</p>
+<div class="pg-item">
+  <div class="pg-row"><label class="pg-label" for="dep_root">根目录</label><input type="text" id="dep_root" placeholder="...\\GSV（它下面应该是 runtime\\gsv\\gsv_server.exe）"><p class="pg-hint">留空就从「引擎」页那个「引擎程序」往上推三级。填错不会弄坏什么，「检查」只读——不下载、不写盘、不改配置。</p></div>
+  <p class="pg-hint">检查看这十五项：<code>gsv_server.exe</code>、<code>ggml-vulkan.dll</code>、<code>ggml.dll</code>、<code>text_sidecar.py</code>、<code>python.exe</code>、七件 gguf（ar / bert / hubert / cond / dit / refcode / vocoder）、<code>g2pW.onnx</code>（中文多音字）、<code>vocab.txt</code>、<code>lid.176.bin</code>（只有 en / auto 才用到）。缺哪件报哪件，带大小，最后单列几套音色。</p>
   <div class="pg-btns" style="margin:8px 0 0"><button class="btn" type="button" id="dep_check">检查缺什么</button><button class="btn" type="button" id="dep_engine">直接下载引擎包（14 MB）</button></div>
+  <p class="pg-hint">「直接下载引擎包」会下、会校验 sha256、会解压——<b>这一页唯一自己写盘的动作就是它</b>，别跟「检查」混了。断了再点一次会从 .part 接着下；sha256 对不上会自动删掉那份分片，不会留个坏包在那儿。</p>
 </div>
 
+<p class="pg-sub">③ 本地包安装（完整包 3.16 GB 走这条）</p>
 <div class="pg-item">
-  <p class="pg-label">③ 本地包安装</p>
-  <div class="pg-row"><label class="pg-label" for="dep_zip">完整包路径</label><input type="text" id="dep_zip" placeholder="...\GSV.CPP-win64-0.1.0.zip"><p class="pg-hint">zip 的完整路径。填完先点「看一下这个包」，它会报大小和 sha256；确认框里也会带字节数。</p></div>
+  <div class="pg-row"><label class="pg-label" for="dep_zip">完整包路径</label><input type="text" id="dep_zip" placeholder="...\\GSV.CPP-win64-0.1.0.zip"><p class="pg-hint">zip 的完整路径。<b>先点「看一下这个包」</b>，它会报大小和 sha256，包打不开也当场说；连大小都读不出来就别急着装。</p></div>
   <div class="pg-btns" style="margin:8px 0 0"><button class="btn" type="button" id="dep_hash">看一下这个包</button><button class="btn" type="button" id="dep_local">从本地包安装</button></div>
+  <p class="pg-hint">完整包自带 runtime\\ 那一层，解到根目录就对了。<b>同名文件会被覆盖</b>——装之前确认根目录没指着正在用的那套，或者先备份。音色文件被覆盖成别的东西，引擎不会报错，只会在合成时用错音色。</p>
+  <p class="pg-hint">断点续传只对「直接下载引擎包」有效：本地包这条路是一次解压，中途断了就是重来。</p>
 </div>
+
 <div class="pg-result wait" id="dep_out" hidden></div>
-<p class="pg-hint">完整包自带 runtime\ 那一层，解到根目录就对了；同名文件会被覆盖。断点续传只对「直接下载引擎包」有效：断了再点一次会从 .part 接着下，sha256 对不上会自动删掉那份分片。</p>
+
+<p class="pg-sub">装完还有三步</p>
+<div class="pg-item">
+<p class="pg-hint">一、回「引擎」页把<b>引擎程序</b>指到新的 <code>gsv_server.exe</code>，<b>启动参数</b>里的 <code>--models</code> 和 <code>--allow-path</code> 也要跟着改——漏改 <code>--allow-path</code>，合成会一口回 403。<br>
+二、点「启动服务」，等二十几秒，回这一页再点一次「检查缺什么」，不对就去「引擎」页看日志文件。<br>
+三、回「音色」页点「检测引擎里有哪些」，确认原来那几套音色还在；不在就说明 <code>voices\\</code> 没跟过来，得手工拷回来。</p>
+</div>
 </section>
 
 <section class="pg-pg" id="pg-cloud" hidden>
@@ -698,7 +722,7 @@ async function depCheck() {
     var lines = [(r.ok ? "齐了。" : "缺 " + r.missing + " 项。") + "根目录：" + r.root];
     (r.items || []).forEach(function (it) {
       var bad = it.bytes === null || it.bytes < it.need;
-      lines.push((bad ? "✗ " : "✓ ") + it.key + (it.bytes === null ? " 不在" : " " + Math.round(it.bytes / 1048576) + " MB") + (it.note ? "（" + it.note + "）" : ""));
+      lines.push((bad ? "✗ " : "✓ ") + it.key + (it.bytes === null ? " 不在" : " " + sizeText(it.bytes)) + (it.note ? "（" + it.note + "）" : ""));
     });
     lines.push(r.voices && r.voices.length ? "音色：" + r.voices.join("、") : "音色：一套都没有（voices\<名字>\manifest.json）");
     depOut(r.ok ? "ok" : "err", lines);
@@ -734,7 +758,7 @@ function depWatch() {
 }
 $("dep_check").onclick = function () { depCheck(); };
 $("dep_engine").onclick = async function () {
-  if (!confirm("下载 gsv.cpp 引擎（约 15 MB，只有 exe 和三个 ggml dll，不含 sidecar / python / 模型）并解压？")) return;
+  if (!confirm("下载 gsv.cpp 引擎（约 15 MB，只有 exe 和两个 ggml dll，不含 sidecar / python / 模型）并解压？")) return;
   try {
     var r = await post("/plugins/voice-gsv/deploy/start", { root: $("dep_root").value.trim(), mode: "engine" });
     depOut("wait", ["已开始：" + r.id, "解到：" + r.root, r.note || ""]);
