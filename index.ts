@@ -42,6 +42,8 @@ const DEFAULTS = {
   interrupt_reading: false,
   /** 原样交给引擎、不做中文化的英文缩写（页面上能改）。默认那几个单位按英文词组念。 */
   pronounce_keep: [...KEEP_DEFAULT] as string[],
+  /** 强制按中文念的词，写「词」或「词=读法」；同一词两边都写时这一份优先。 */
+  pronounce_cn: [] as string[],
   timeout_ms: 120_000,
   out_dir: join(HERE, "data", "out"),
   engine: "local",
@@ -410,6 +412,7 @@ export async function apply(ctx: Context) {
       gsv: { ...DEFAULTS.gsv, ...((flat.gsv as Partial<GsvConfig>) ?? {}) },
     };
     cfg.pronounce_keep = normalizeKeep((cfg as any).pronounce_keep);
+    cfg.pronounce_cn = normalizeKeep((cfg as any).pronounce_cn);
     g = cfg.gsv;
     return cfg;
   }
@@ -508,7 +511,7 @@ export async function apply(ctx: Context) {
         inBody = true;
         return true;
       }).join("\n");
-      const clean = forSpeech(body, cfg.pronounce_keep).trim();
+      const clean = forSpeech(body, cfg.pronounce_keep, cfg.pronounce_cn).trim();
       if (!clean) continue;
       const meat = clean.replace(/代码略|表格略/g, "").replace(/[\s\p{P}\p{S}]/gu, "");
       if (meat.length < 2) continue;
@@ -523,6 +526,11 @@ export async function apply(ctx: Context) {
       // 这里不等它落定——pump 起来还要先合成（几百毫秒），等合成完那个播放进程早没了。
       void cancelSpeech();
     }
+    enqueuePending(text);
+  }
+
+  /** 已处理过打断的请求直接入队，保留原来的代际号与待播队列。 */
+  function enqueuePending(text: string) {
     if (queue.length >= 2) queue.shift();
     queue.push(text);
     pump();
@@ -898,6 +906,10 @@ export async function apply(ctx: Context) {
 
   /** 单句：合成一段，落盘，可选播放。 */
   async function speakOne(text: string, wantPlay: boolean, speed?: number, voiceName?: string) {
+    const mine = gen;
+    const check = () => {
+      if (wantPlay && mine !== gen) throw new Error(CANCELLED);
+    };
     if (String(cfg.engine || "local") === "local" && !resolveVoice(cfg, voiceName).ref_audio) throw new Error("没配参考音频，念不了");
     if (String(cfg.engine || "local") === "local" && !(await portOpen(g.port, g.host))) {
       throw new Error(`GPT-SoVITS 没在跑（${g.host}:${g.port}）。用 gsv_start 起它。`);
@@ -905,9 +917,18 @@ export async function apply(ctx: Context) {
     if (String(cfg.engine || "local") === "local" && cfg.sync_default_refer !== false && !referSync.ok) {
       await syncRefer().catch(() => false);
     }
+    check();
     const buf = await synth(text, speed, voiceName);
+    check();
     const file = await saveWav(buf);
-    if (wantPlay) await playFile(file);
+    if (wantPlay) {
+      check();
+      try {
+        await playFile(file);
+      } finally {
+        check();
+      }
+    }
     return file;
   }
 
@@ -930,7 +951,7 @@ export async function apply(ctx: Context) {
     check();
     const engine = String(cfg.engine || "local");
     if (engine === "local" && !resolveVoice(cfg).ref_audio) throw new Error("没配参考音频，念不了");
-    const clean = forSpeech(rawText, cfg.pronounce_keep);
+    const clean = forSpeech(rawText, cfg.pronounce_keep, cfg.pronounce_cn);
     if (!clean) throw new Error("这段话过滤后没什么可念的");
     // 只在「清洗后只剩代码/表格占位」时才拒念。原来的门槛是剩余字数 < 6，
     // 结果「嗓子合好了。」这种五个字的短句也被当成空话挡掉了。
@@ -1008,15 +1029,11 @@ export async function apply(ctx: Context) {
           await halted;
           await waitIdle(mine);
           if (mine !== gen) throw new Error(CANCELLED);
+          if (busy) {
+            enqueuePending(text);
+            return `已排队：${text.slice(0, 40)}${text.length > 40 ? "…" : ""}\n上一段还在收尾，这句排在它后面念。${warn ? "\n注意：" + warn : ""}`;
+          }
         } else throw new Error("上一段还在念，等它念完再试");
-      }
-      const mine = gen;
-      await waitIdle(mine);
-      if (mine !== gen) throw new Error(CANCELLED);
-      if (busy || CURRENT_PLAY) {
-        // 同上：等不到就排队，不丢这一句。
-        enqueue(text);
-        return `已排队：${text.slice(0, 40)}${text.length > 40 ? "…" : ""}\n上一段还在收尾，这句排在它后面念。${warn ? "\n注意：" + warn : ""}`;
       }
       let file: string;
       busy = true;
@@ -1195,7 +1212,7 @@ export async function apply(ctx: Context) {
           if (busy) {
             // 旧的合成请求还没回来，收手要几百毫秒到几秒。等不到就交给队列，
             // 别让这一句凭空消失——它已经被掐掉一次了，不该再吃掉第二条。
-            enqueue(text);
+            enqueuePending(text);
             return replyJson(res, 200, { ok: true, queued: true, text: "上一段还在收尾，这一句排在它后面接着念。" });
           }
         } else {
@@ -1234,7 +1251,7 @@ export async function apply(ctx: Context) {
           await waitIdle(mine);
           if (mine !== gen) throw new Error(CANCELLED);
           if (busy) {
-            enqueue("嗓子通了，我是勘。这句话是用来试音色的。");
+            enqueuePending("嗓子通了，我是勘。这句话是用来试音色的。");
             return replyJson(res, 200, { ok: true, queued: true, text: "上一段还在收尾，试音句排在它后面念。" });
           }
         } else return replyJson(res, 409, { ok: false, error: "上一段还在念，等它念完" });

@@ -48,7 +48,7 @@ const LETTER: Record<string, string> = {
 };
 
 /** 默认不改写、原样交给引擎的英文缩写。单位按英文词组念，比「吉字节」自然。页面上能改这份名单。 */
-export const KEEP_DEFAULT = ["GB", "MB", "KB", "TB", "GiB", "MiB", "KiB"];
+export const KEEP_DEFAULT = ["GB", "MB", "KB", "TB", "GiB", "MiB", "KiB", "ms", "px", "pt", "cm", "mm"];
 
 /** 常见单位与缩写的口语读法，长的放前面，先吃掉。 */
 const WORDS: [RegExp, string][] = [
@@ -58,6 +58,50 @@ const WORDS: [RegExp, string][] = [
   [/\bms\b/g, "毫秒"], [/\bsec\b|\bsecs\b/g, "秒"],
   [/\bUTF-8\b/g, "优替艾弗八"], [/\bJSON\b/g, "杰森"], [/\bAPI\b/g, "接口"],
 ];
+
+/** 内置读法的反查表：给中文白名单里「只写词、不写读法」的条目用。键不区分大小写。 */
+const CN_LOOKUP: Record<string, string> = {
+  GiB: "吉字节", MiB: "兆字节", KiB: "千字节",
+  GB: "吉字节", MB: "兆字节", KB: "千字节", TB: "太字节",
+  kHz: "千赫兹", Hz: "赫兹", fps: "帧每秒",
+  ms: "毫秒", sec: "秒", secs: "秒",
+  "UTF-8": "优替艾弗八", JSON: "杰森", API: "接口",
+};
+
+/** 查内置读法，先精确再忽略大小写。 */
+function cnLookup(word: string): string {
+  if (CN_LOOKUP[word]) return CN_LOOKUP[word];
+  const hit = Object.keys(CN_LOOKUP).find((k) => k.toLowerCase() === word.toLowerCase());
+  return hit ? CN_LOOKUP[hit] : "";
+}
+
+/**
+ * 中文白名单：列在这里的词强制按中文念，不管它前后有没有汉字。
+ * 每项写「词」或「词=读法」；只写词时先查内置表（ms → 毫秒、GB → 吉字节），查不到就用逐字母近似（K → 开）。
+ * 同一个词两边都写时，这一份优先于「原样念」那一份。
+ */
+export function cnReadings(list: unknown): [string, string][] {
+  const arr = Array.isArray(list) ? list : typeof list === "string" ? String(list).split(/[,，;；\s]+/) : [];
+  const out: [string, string][] = [];
+  for (const raw of arr) {
+    const one = String(raw ?? "").trim();
+    if (!one) continue;
+    const eq = one.indexOf("=");
+    const word = (eq > 0 ? one.slice(0, eq) : one).trim();
+    let read = eq > 0 ? one.slice(eq + 1).trim() : "";
+    if (!word) continue;
+    if (!read) read = cnLookup(word);
+    if (!read) {
+      const chars = [...word];
+      if (chars.length && chars.every((ch) => LETTER[ch] || /[\d\s]/.test(ch))) read = chars.map((ch) => LETTER[ch] ?? ch).join("");
+    }
+    if (!read || read === word) continue;
+    if (out.some(([w]) => w === word)) continue;
+    out.push([word, read]);
+    if (out.length >= 40) break;
+  }
+  return out;
+}
 
 /** 附近（前后各 8 个字符）有没有汉字。用来判断这一段该按中文读还是留给引擎按原文读。 */
 const CJK_RE = /[\u4e00-\u9fa5]/;
@@ -72,21 +116,26 @@ function nearChinese(source: string, at: number, len: number): boolean {
  * 成句的英文词不动，那是内容，改了更糟。
  * 数字和单位只在贴着中文时才改写，纯英文上下文原样留着，把中英混排的活儿还给引擎。
  */
-export function normalizeForSpeech(input: string, keep: string[] = KEEP_DEFAULT): string {
+export function normalizeForSpeech(input: string, keep: string[] = KEEP_DEFAULT, cn: unknown = []): string {
   let s = String(input ?? "");
-  // 白名单里的词先抠出来换成不会撞任何规则的占位符，处理完再原样放回。
+  // 两边名单的词都先抠出来换成不会撞任何规则的占位符，处理完再放回。
   const stash: string[] = [];
+  const esc = (w: string) => w.split("").map((ch) => "^$.*+?()[]{}|-".includes(ch) ? String.fromCharCode(92) + ch : ch).join("");
+  const put = (text: string) => {
+    stash.push(text);
+    return "\u0001" + "\u0002".repeat(stash.length) + "\u0001";
+  };
+  // 中文白名单先来：同一个词两份都写时，中文这一份覆盖「原样念」那一条。
+  for (const [word, read] of cnReadings(cn)) {
+    s = s.replace(new RegExp("(?<![A-Za-z0-9])" + esc(word) + "(?![A-Za-z0-9])", "g"), () => put(read));
+  }
   const words = (Array.isArray(keep) ? keep : [])
     .map((one) => String(one ?? "").trim())
     .filter(Boolean)
     .slice(0, 40);
   if (words.length) {
-    const esc = (w: string) => w.split("").map((ch) => "^$.*+?()[]{}|-".includes(ch) ? String.fromCharCode(92) + ch : ch).join("");
     const re = new RegExp("(?<![A-Za-z0-9])(?:" + words.map(esc).join("|") + ")(?![A-Za-z0-9])", "g");
-    s = s.replace(re, (m: string) => {
-      stash.push(m);
-      return "\u0001" + "\u0002".repeat(stash.length) + "\u0001";
-    });
+    s = s.replace(re, (m: string) => put(m));
   }
   for (const [re, to] of WORDS) {
     s = s.replace(re, (m: string, offset: number) => (nearChinese(s, offset, m.length) ? to : m));
@@ -109,7 +158,7 @@ export function normalizeForSpeech(input: string, keep: string[] = KEEP_DEFAULT)
 }
 
 /** 去掉念出来会变成噪音的东西。 */
-export function forSpeech(input: string, keep: string[] = KEEP_DEFAULT): string {
+export function forSpeech(input: string, keep: string[] = KEEP_DEFAULT, cn: unknown = []): string {
   let s = String(input ?? "");
   s = s.replace(/```[\s\S]*?```/g, "。代码略。");
   s = s.replace(/`[^`]*`/g, "");
@@ -140,7 +189,7 @@ export function forSpeech(input: string, keep: string[] = KEEP_DEFAULT): string 
   s = s.replace(/（略）([，,、\s]*（略）)+/g, "（略）");
   s = s.replace(/\s*（略）\s*/g, "（略）");
   s = s.replace(/\*\*|__|~~|\*/g, "");
-  s = normalizeForSpeech(s, keep);
+  s = normalizeForSpeech(s, keep, cn);
   s = s.replace(/[，,]{2,}/g, "，");
   s = s.replace(/，\s*，/g, "，");
   s = s.replace(/([。！？；])，/g, "$1");
