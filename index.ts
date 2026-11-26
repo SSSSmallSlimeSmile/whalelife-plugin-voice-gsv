@@ -6,7 +6,8 @@
  * 合成地址与参考音沿用原先两个插件里调好的参数，字段名跟 api_v2 一致，gsv.cpp 也认。
  */
 import type { Context } from "../../core/context.ts";
-import { execFile, spawn, execFileSync } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, writeFile, open, readdir, stat } from "node:fs/promises";
 import { createConnection } from "node:net";
@@ -96,7 +97,7 @@ function replyJson(res: any, code: number, body: any) {
 }
 
 /** 正在播的那个 powershell 子进程。PlaySync 会一直阻塞到播完，所以掐它就是掐声音。 */
-let CURRENT_PLAY: any = null;
+let CURRENT_PLAY: ChildProcess | null = null;
 
 function playFile(file: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -114,20 +115,41 @@ function playFile(file: string): Promise<void> {
   });
 }
 
-/** 掐掉正在念的那一句。子进程死了，PlaySync 跟着结束，playFile 的 promise 也就 resolve 了。 */
-function stopPlayback() {
+/** 等一个子进程真的退出，超时返回 false。 */
+function waitExit(child: ChildProcess, ms: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(child.exitCode !== null || child.signalCode !== null), ms);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+  });
+}
+
+/**
+ * 掐掉正在念的那一句。被终止的播放会让 playFile reject。
+ * 先按手里的子进程句柄杀——那是自己 spawn 出来的，不靠 PID 猜；200ms 没退才走 taskkill 兜底，
+ * 那条按 PID 打，所以把映像名钉成 powershell.exe，免得打到系统把同一个号发给了别人。
+ * 全程异步：原来是 execFileSync，最坏能把事件循环卡住 8 秒。
+ */
+async function stopPlayback(): Promise<boolean> {
   const child = CURRENT_PLAY;
   CURRENT_PLAY = null;
-  if (!child) return false;
-  // 只调 child.kill() 在这台机器上实测杀不掉——进程表里那句 PlaySync 还活着，
-  // 新的一句上来就变成两句叠着响。改走 taskkill /T /F，连子树一起。
-  try {
-    if (child.pid) execFileSync("taskkill.exe", ["/T", "/F", "/PID", String(child.pid)], { windowsHide: true, timeout: 8_000, stdio: "ignore" });
-    else child.kill();
-    return true;
-  } catch {
-    try { child.kill(); return true; } catch { return false; }
-  }
+  if (!child || child.exitCode !== null || child.signalCode !== null) return false;
+  try { child.kill(); } catch {}
+  if (await waitExit(child, 200)) return true;
+  if (!child.pid) return false;
+  // 兜底：连子树一起。实测只调 child.kill() 有时那句 PlaySync 还活着，新的一句上来会两句叠着响。
+  await new Promise<void>((resolve) => {
+    execFile(
+      "taskkill.exe",
+      ["/T", "/F", "/PID", String(child.pid), "/FI", "IMAGENAME eq powershell.exe"],
+      { windowsHide: true, timeout: 8_000 },
+      () => resolve(),
+    );
+  });
+  return true;
 }
 
 /** 端口有没有人在听。只看 TCP 连通，不问对方是谁。 */
@@ -221,8 +243,15 @@ async function sidecarStart(cfg: GsvConfig, logger: { info: (m: string) => void;
     detached: true,
     stdio: ["ignore", handle ? handle.fd : "ignore", handle ? handle.fd : "ignore"],
   });
-  child.unref();
-  if (handle) await handle.close().catch(() => {});
+  try {
+    await once(child, "spawn");
+    child.unref();
+  } catch (error) {
+    logger.warn(`文本前端启动失败：${error instanceof Error ? error.message : String(error)}`);
+    throw error;
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
   logger.info(`文本前端启动中，端口 ${plan.port}，pid=${child.pid ?? "?"}`);
   return { started: true, pid: child.pid ?? null, port: plan.port };
 }
@@ -254,8 +283,12 @@ async function gsvStart(cfg: GsvConfig, logger: { info: (m: string) => void; war
     detached: true,
     stdio: ["ignore", handle ? handle.fd : "ignore", handle ? handle.fd : "ignore"],
   });
-  child.unref();
-  if (handle) await handle.close().catch(() => {});
+  try {
+    await once(child, "spawn");
+    child.unref();
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
   logger.info(`GSV 启动中，pid=${child.pid ?? "?"}`);
   const sidecar = await sidecarStart(cfg, logger).catch((error: any) => ({
     started: false,
@@ -291,11 +324,11 @@ async function killPort(port: number, match: ((name: string) => boolean) | null)
     else targets.push(pid);
   }
   for (const pid of targets) {
-    execFile("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { windowsHide: true }, () => {});
+    execFile("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, timeout: 5_000 }, () => {});
   }
   const deadline = Date.now() + 5000;
   while (targets.length && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, Math.min(200, deadline - Date.now())));
+    await new Promise((r) => setTimeout(r, Math.max(1, Math.min(200, deadline - Date.now()))));
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
     if (!(await pidByPort(port, remaining)).length) return { stopped: true, pids: targets, refused };
@@ -321,7 +354,7 @@ async function gsvStop(cfg: GsvConfig) {
 /** 停服务的回执：杀掉的、被拒绝的都写出来，不把「没动」说成「已结束」。 */
 function stopMessage(r: { stopped: boolean; pids: number[]; refused: { pid: number; name: string; port: number }[] }, cfg: GsvConfig) {
   const parts: string[] = [];
-  if (r.pids.length) parts.push(`已尝试结束 PID ${r.pids.join(", ")}。${r.stopped ? "至少一个目标端口已确认释放" : "未确认目标端口释放"}`);
+  if (r.pids.length) parts.push(`已尝试结束 PID ${r.pids.join(", ")}。${r.stopped ? "至少一个目标端口已确认释放" : "未能确认目标端口已释放，进程可能已退出"}`);
   for (const one of r.refused) parts.push(`端口 ${one.port} 上的 PID ${one.pid}（${one.name}）未通过进程识别，未结束`);
   if (!parts.length) {
     const ports = [...new Set([cfg.port, sidecarPlan(cfg).port])];
@@ -395,11 +428,12 @@ export async function apply(ctx: Context) {
     return out;
   }
 
-  /** 掐掉正在念的和排队的。gen 加一，正在跑的那轮合成/播放循环到下一个 await 点就知道收手。 */
-  function cancelSpeech() {
+  /** 掐掉正在念的和排队的。gen 加一，正在跑的那轮合成/播放循环到下一个 await 点就知道收手。
+   *  返回的 promise 等到播放子进程真的没了才落定——要接着开新的一句，就得等它。 */
+  function cancelSpeech(): Promise<void> {
     gen += 1;
     queue.length = 0;
-    stopPlayback();
+    return stopPlayback().then(() => undefined, () => undefined);
   }
 
   /** 等当前持有者收手，同时让更新的请求淘汰正在等待的请求。 */
@@ -433,8 +467,9 @@ export async function apply(ctx: Context) {
    * 一段的第一行是不是列表项。原来那版要求标记后面必须跟空白或结尾，
    * 于是「1、改代码」这种中文顿号直接接字的写法漏判了——整条清单被当成正文念。
    */
-  const LIST_LINE = /^(?:[-*+•·](?:\s|$)|\d{1,2}[.)](?:\s|$)|\d{1,2}、)/;
+  const LIST_LINE = /^(?:[-*+•·](?:\s|$)|\d{1,2}[.)](?:\s|$)|\d{1,2}、(?![ \t]*\d))/;
   const RULE_LINE = /^(?:(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,})$/;
+  const LIST_INDENT = /^(?: {2}|\t)/;
 
   /**
    * 取回复的第一段。空行分段，跳过只有代码/表格的块；开头是清单就跳过清单、念清单后面那段正文。
@@ -449,11 +484,20 @@ export async function apply(ctx: Context) {
         inList = false;
         continue;
       }
-      inList = LIST_LINE.test(first.trim()) || (inList && /^(?: {2}|\t)/.test(first));
+      inList = inList && LIST_INDENT.test(first);
+      let inBody = false;
       const body = lines.filter((line) => {
         const trimmed = line.trim();
         if (RULE_LINE.test(trimmed)) return false;
-        return !inList || (!LIST_LINE.test(trimmed) && !/^\s/.test(line));
+        if (inBody) return true;
+        if (LIST_LINE.test(trimmed)) {
+          inList = true;
+          return false;
+        }
+        if (inList && LIST_INDENT.test(line)) return false;
+        inList = false;
+        inBody = true;
+        return true;
       }).join("\n");
       const clean = forSpeech(body, cfg.pronounce_keep).trim();
       if (!clean) continue;
@@ -466,8 +510,9 @@ export async function apply(ctx: Context) {
 
   function enqueue(text: string) {
     if (cfg.interrupt_reading && (busy || queue.length)) {
-      // 勾了「新的顶掉旧的」：掐掉正在念的，排队的也一起清，然后只念这一句
-      cancelSpeech();
+      // 勾了「新的顶掉旧的」：掐掉正在念的，排队的也一起清，然后只念这一句。
+      // 这里不等它落定——pump 起来还要先合成（几百毫秒），等合成完那个播放进程早没了。
+      void cancelSpeech();
     }
     if (queue.length >= 2) queue.shift();
     queue.push(text);
@@ -941,9 +986,30 @@ export async function apply(ctx: Context) {
       const text = String(args?.text ?? "").trim().slice(0, 200);
       if (!text) throw new Error("text 不能为空");
       const wantPlay = args?.play !== false;
-      const file = await speakOne(text, wantPlay, args?.speed, args?.voice);
       const warn = staleVoice(cfg);
-      return `${wantPlay ? "已播放" : "已生成"}：${text.slice(0, 40)}${text.length > 40 ? "…" : ""}\n把下面这行原样放进回复就能在页面里播放：\n[[voice:${file}]]${warn ? "\n注意：" + warn : ""}`;
+      if (!wantPlay) {
+        const file = await speakOne(text, false, args?.speed, args?.voice);
+        return `已生成：${text.slice(0, 40)}${text.length > 40 ? "…" : ""}\n把下面这行原样放进回复就能在页面里播放：\n[[voice:${file}]]${warn ? "\n注意：" + warn : ""}`;
+      }
+      // 播放这条路只有一把钥匙：跟 /say、mouth_say 共用 busy。
+      // 不然两边各自起一个播放器，CURRENT_PLAY 只记得住后一个，先响的那句就掐不掉了。
+      if (busy || queue.length) {
+        if (cfg.interrupt_reading) await cancelSpeech();
+        else throw new Error("上一段还在念，等它念完再试");
+      }
+      const mine = gen;
+      await waitIdle(mine);
+      if (mine !== gen) throw new Error(CANCELLED);
+      if (busy || CURRENT_PLAY) throw new Error("上一段仍在收尾，稍后再试");
+      let file: string;
+      busy = true;
+      try {
+        file = await speakOne(text, true, args?.speed, args?.voice);
+      } finally {
+        busy = false;
+        if (queue.length) pump();
+      }
+      return `已播放：${text.slice(0, 40)}${text.length > 40 ? "…" : ""}\n把下面这行原样放进回复就能在页面里播放：\n[[voice:${file}]]${warn ? "\n注意：" + warn : ""}`;
     }),
   });
 
@@ -1017,7 +1083,7 @@ export async function apply(ctx: Context) {
     run: safe(async () => {
       await reload();
       const r = await gsvStop(g);
-      referSync = { ok: false, at: 0, key: "", error: "引擎已停" };
+      referSync = { ok: false, at: 0, key: "", error: "发出停止请求后需重新同步默认音色" };
       return stopMessage(r, g);
     }),
   });
@@ -1069,7 +1135,7 @@ export async function apply(ctx: Context) {
     try {
       await reload();
       const r = await gsvStop(g);
-      referSync = { ok: false, at: 0, key: "", error: "引擎已停" };
+      referSync = { ok: false, at: 0, key: "", error: "发出停止请求后需重新同步默认音色" };
       return replyJson(res, 200, {
         ok: true,
         stopped: r.stopped,
@@ -1103,8 +1169,8 @@ export async function apply(ctx: Context) {
       await reload();
       if (busy || queue.length) {
         if (cfg.interrupt_reading) {
-          // 勾了「新的顶掉旧的」：掐掉再念，不返回 409
-          cancelSpeech();
+          // 勾了「新的顶掉旧的」：掐掉再念，不返回 409。先等旧的那句真没了，免得两句叠响。
+          await cancelSpeech();
           const mine = gen;
           await waitIdle(mine);
           if (mine !== gen) throw new Error(CANCELLED);
@@ -1140,7 +1206,7 @@ export async function apply(ctx: Context) {
       await reload();
       if (busy || queue.length) {
         if (cfg.interrupt_reading) {
-          cancelSpeech();
+          await cancelSpeech();
           const mine = gen;
           await waitIdle(mine);
           if (mine !== gen) throw new Error(CANCELLED);

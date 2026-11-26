@@ -359,7 +359,7 @@ export function renderPage(cfg: any, status: any = {}, ttsList: any[] = []): str
 
 <div class="pg-pair" id="cloudrow">
   <div class="pg-item"><div class="pg-row"><label class="pg-label" for="cloud_key">云端 API Key</label><input type="password" id="cloud_key" value="${esc(c.cloud_key)}" placeholder="留空就用主配置里 DeepSeek 那把"${dis || (fromModel ? " disabled" : "")}><p class="pg-hint">留空会自动读主配置里 id 含 deepseek 的 provider。</p></div></div>
-  <div class="pg-item"><div class="pg-row"><label class="pg-label" for="cloud_voice">云端音色</label><select id="cloud_voice"${dis}>${voiceOptions(c.cloud_voice)}</select><p class="pg-hint">云端没给列表接口，点一下让它自己报一遍合法音色<button class="btn" type="button" id="loadvoices">读取云端音色</button></p></div></div>
+  <div class="pg-item"><div class="pg-row"><label class="pg-label" for="cloud_voice">云端音色</label><select id="cloud_voice"${dis}>${voiceOptions(c.cloud_voice)}</select><p class="pg-hint">云端没有音色列表接口，点「检测」让它自己报一遍；本地引擎在跑时也能点，只作备份用<button class="btn" type="button" id="loadvoices">检测云端音色</button></p></div></div>
 </div>
 </section>
 
@@ -438,7 +438,7 @@ function cloudSync() {
   const fromModel = value.indexOf("tts:") === 0;
   $("cloud_key").disabled = !isCloud || fromModel;
   $("cloud_voice").disabled = !isCloud;
-  $("loadvoices").disabled = !isCloud;
+  $("loadvoices").disabled = false;
   $("cloudrow").style.opacity = isCloud && !fromModel ? "1" : "0.45";
 }
 $("engine").onchange = cloudSync;
@@ -605,14 +605,22 @@ loadRefs();
 $("loadvoices").onclick = async () => {
   const select = $("cloud_voice");
   const keep = select.value;
-  show("wait", "正在问云端要音色…");
+  show("wait", "正在问云端…");
   try {
     const r = await post("/plugins/voice-gsv/voices", {});
     const list = Array.isArray(r.voices) ? r.voices : [];
     if (!list.length) throw new Error("云端没给出音色");
     select.innerHTML = list.map((v) => '<option value="' + v + '">' + (NAMES[v] || v) + "</option>").join("");
-    select.value = list.indexOf(keep) >= 0 ? keep : list[0];
-    show("ok", "云端报了 " + list.length + " 个音色：" + list.join("、") + (r.source === "cloud" ? "（从云端读到的）" : "（默认兜底）") + "。记得点保存。");
+    const keepOk = list.indexOf(keep) >= 0;
+    select.value = keepOk ? keep : list[0];
+    const cloudNow = $("engine").value !== "local";
+    show(
+      "ok",
+      "云端报了 " + list.length + " 个音色：" + list.join("、") +
+        (r.source === "cloud" ? "（从云端问出来的）" : "（没问到，用默认两个）") +
+        (keepOk ? "；当前选的 " + keep + " 在列表里" : "；当前选的「" + keep + "」不在列表里，已换成 " + select.value) +
+        (cloudNow ? "。记得点保存。" : "。当前引擎是本地，这只是备份，不用保存。"),
+    );
   } catch (error) {
     show("err", "没读到：" + (error && error.message ? error.message : error));
   }
