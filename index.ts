@@ -1308,6 +1308,14 @@ export async function apply(ctx: Context) {
       }
       if (cfg.ref_audio) dirs.unshift(dirname(cfg.ref_audio));
       const known: any[] = Array.isArray(cfg.voices) ? (cfg.voices as any[]) : [];
+      // 目录里每个 wav 识别出来的文本（data/ref-texts.json）。识别自音频，可能有错字，
+      // 只给页面回填用，不入库、不参与合成。
+      let hints: Record<string, any> = {};
+      try {
+        hints = JSON.parse(readFileSync(join(HERE, "data", "ref-texts.json"), "utf8")) || {};
+      } catch {
+        hints = {};
+      }
       const used = new Set<string>();
       const items: any[] = [];
       for (const dir of dirs) {
@@ -1320,12 +1328,15 @@ export async function apply(ctx: Context) {
           const info = await stat(path).catch(() => null);
           if (!info || !info.isFile()) continue;
           const hit = known.find((one) => one && String(one.ref_audio || "") === path);
+          const hint = hints[name] && typeof hints[name] === "object" ? hints[name] : {};
           items.push({
             name,
             path,
             bytes: info.size,
             registered: Boolean(hit),
             voice: hit ? String(hit.name || "") : "",
+            hint: typeof hint.text === "string" ? hint.text : "",
+            hint_note: typeof hint.note === "string" ? hint.note : "",
           });
         }
       }
