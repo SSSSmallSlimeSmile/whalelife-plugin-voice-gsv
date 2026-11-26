@@ -8,7 +8,8 @@
  */
 import { createHash } from "node:crypto";
 import { createWriteStream, existsSync } from "node:fs";
-import { mkdir, open, readdir, rename, rm, stat } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
@@ -94,6 +95,8 @@ type Job = {
   bytes: number;
   total: number | null;
   phase: "download" | "verify" | "extract" | "done" | "failed";
+  /** 解压前看出来的包形状。 */
+  shape?: "packaged" | "flat";
   sha256?: string;
   error?: string;
   startedAt: number;
@@ -199,6 +202,85 @@ function extractZip(zip: string, into: string) {
   });
 }
 
+/** 只读地列一遍 zip 里的名字。用 .NET 的 ZipFile，不落临时解压目录。 */
+async function listZipEntries(zip: string): Promise<string[]> {
+  const out = join(tmpdir(), `gsv-zip-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.txt`);
+  const q = (v: string) => v.replace(/'/g, "''");
+  const ps = [
+    "$ErrorActionPreference='Stop'",
+    "Add-Type -AssemblyName System.IO.Compression.FileSystem",
+    `$z=[IO.Compression.ZipFile]::OpenRead('${q(zip)}')`,
+    "try { $n=@($z.Entries | ForEach-Object { $_.FullName }) } finally { $z.Dispose() }",
+    `[IO.File]::WriteAllLines('${q(out)}', $n, [Text.UTF8Encoding]::new($false))`,
+  ].join("; ");
+  await new Promise<void>((ok, fail) => {
+    const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps], { windowsHide: true });
+    let err = "";
+    child.stderr.on("data", (b) => (err += b.toString("utf8")));
+    child.on("error", fail);
+    child.on("close", (code) => (code === 0 ? ok() : fail(new Error(`读不了这个包的目录（${code}）：${err.trim().slice(0, 200)}`))));
+  });
+  let text = "";
+  try {
+    text = await readFile(out, "utf8");
+  } finally {
+    await rm(out, { force: true });
+  }
+  return text.split(/\r?\n/).map((v) => v.trim()).filter(Boolean);
+}
+
+export type ZipShape = {
+  /** packaged：自己带 runtime/ 前缀（官方完整包）；flat：平铺的 exe（GitHub 那个 15MB 包）。 */
+  kind: "packaged" | "flat";
+  /** 条目外面还套了几层目录，解压后要跳过这一段。 */
+  strip: string;
+  entries: number;
+};
+
+/** 从名字列表判断包形状。判不出来返回 null——那种包不该往盘上写。 */
+export function pickZipShape(rawNames: string[]): ZipShape | null {
+  // PowerShell 的 Compress-Archive 用反斜杠当分隔符，不符合 zip 规范但很常见。一律归一。
+  const names = rawNames.map((n) => n.replace(/\\/g, "/"));
+  const shallow = (pre: string) => pre.split("/").filter(Boolean).length <= 1;
+  for (const n of names) {
+    const i = n.indexOf("runtime/");
+    if (i < 0) continue;
+    const pre = n.slice(0, i);
+    if (!shallow(pre)) continue;
+    return { kind: "packaged", strip: pre, entries: names.length };
+  }
+  const exe = "gsv_server.exe";
+  for (const n of names) {
+    if (!n.toLowerCase().endsWith(exe)) continue;
+    const pre = n.slice(0, n.length - exe.length);
+    if (!shallow(pre)) continue;
+    return { kind: "flat", strip: pre, entries: names.length };
+  }
+  return null;
+}
+
+/** 把 src 下的东西并进 dest：同名覆盖，dest 里多出来的（音色、自己放的模型）一律不动。 */
+async function mergeMove(src: string, dest: string) {
+  await mkdir(dest, { recursive: true });
+  for (const name of await readdir(src)) {
+    const from = join(src, name);
+    const to = join(dest, name);
+    const sf = await stat(from);
+    let dt: any = null;
+    try {
+      dt = await stat(to);
+    } catch {
+      dt = null;
+    }
+    if (sf.isDirectory() && dt?.isDirectory()) {
+      await mergeMove(from, to);
+      continue;
+    }
+    await rm(to, { recursive: true, force: true });
+    await rename(from, to);
+  }
+}
+
 export type InstallRequest = {
   url?: string;
   sha256?: string;
@@ -251,8 +333,30 @@ export function startInstall(req: InstallRequest) {
       }
       if (req.extract !== false) {
         cur.phase = "extract";
-        await mkdir(into, { recursive: true });
-        await extractZip(zip, into);
+        // 先看清楚包里是什么，再动盘。判不出来就一个字节都不写。
+        const shape = pickZipShape(await listZipEntries(zip));
+        if (!shape) {
+          throw new Error("这个包不像 gsv.cpp 的引擎包：里面既没有 runtime/ 目录，也没有 gsv_server.exe。目标目录没动过。");
+        }
+        cur.shape = shape.kind;
+        // 完整包自带 runtime/，落到解包根；平铺的引擎包得塞进 runtime\\gsv。
+        const target = shape.kind === "packaged" ? root : join(root, "runtime", "gsv");
+        cur.into = target;
+        // 解到同级临时目录，验完形状再搬。搬的是 rename，失败最多留下临时目录，不会覆盖到一半。
+        const staging = join(dirname(root), `.voice-gsv-incoming-${cur.id}`);
+        await rm(staging, { recursive: true, force: true });
+        await mkdir(staging, { recursive: true });
+        try {
+          await extractZip(zip, staging);
+          const real = join(staging, shape.strip);
+          const anchor = shape.kind === "packaged" ? join(real, "runtime", "gsv", "gsv_server.exe") : join(real, "gsv_server.exe");
+          if (!existsSync(anchor)) {
+            throw new Error(`包解开了，但里面找不到 ${shape.kind === "packaged" ? "runtime\\gsv\\gsv_server.exe" : "gsv_server.exe"}。目标目录没动过。`);
+          }
+          await mergeMove(real, target);
+        } finally {
+          await rm(staging, { recursive: true, force: true }).catch(() => {});
+        }
       }
       cur.phase = "done";
     } catch (error: any) {

@@ -383,9 +383,9 @@ export function renderPage(cfg: any, status: any = {}, ttsList: any[] = []): str
 
 <p class="pg-sub">先看自己属于哪种</p>
 <div class="pg-item">
-<p class="pg-hint"><b>① 本机已有引擎（现在这种）</b>：点下面 ② 的「检查缺什么」，十七项全绿就完事了，不用装、不用改配置。<br>
-<b>② 换台机器 / 自己重装</b>：手上有那个 3.16 GB 的完整包，走 ③ 填路径 →「看一下这个包」→「从本地包安装」。<br>
-<b>③ 手上什么都没有</b>：首次部署请准备完整包。约 15 MB 的独立引擎包只有 gsv_server.exe 和四个 ggml DLL。</p>
+<p class="pg-hint"><b>· 本机已有引擎（现在这种）</b>：点下面「② 解包根目录」里的「检查缺什么」，十七项全绿就完事，不用装、不用改配置。<br>
+<b>· 换台机器 / 自己重装</b>：手上有那个 3.16 GB 的完整包，走下面「③ 本地包安装」填路径 →「看一下这个包」→「从本地包安装」。<br>
+<b>· 手上什么都没有</b>：首次部署要先准备完整包。约 15 MB 的独立引擎包只有 gsv_server.exe 和四个 ggml DLL，不够用。</p>
 </div>
 
 <p class="pg-sub">① 拿到包</p>
@@ -747,7 +747,7 @@ function depWatch() {
       var phase = { download: "下载中", verify: "校验中", extract: "解压中", done: "完成", failed: "失败" }[j.phase] || j.phase;
       var lines = [phase + (pct === null ? "" : " " + pct + "%") + " · " + Math.round(j.bytes / 1048576) + (j.total ? " / " + Math.round(j.total / 1048576) : "") + " MB"];
       lines.push("文件：" + j.dest);
-      lines.push("解到：" + j.into);
+      lines.push("解到：" + j.into + (j.shape ? "（" + (j.shape === "packaged" ? "完整包，按原结构" : "引擎包，落到 runtime\\gsv") + "）" : ""));
       if (j.error) lines.push("原因：" + j.error);
       depOut(j.phase === "failed" ? "err" : j.phase === "done" ? "ok" : "wait", lines);
       if (j.phase === "done" || j.phase === "failed") { depStop(); if (j.phase === "done") depCheck(); return; }
