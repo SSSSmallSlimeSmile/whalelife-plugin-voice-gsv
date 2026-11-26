@@ -303,7 +303,7 @@ export function renderPage(cfg: any, status: any = {}, ttsList: any[] = []): str
 
 <div class="pg-pair">
   <div class="pg-item"><div class="pg-row"><label class="pg-label" for="voice_name">当前音色</label><select id="voice_name">${voiceOpts}</select><p class="pg-hint">选中的那套参考音。选「不用库」就用下面手填的那对。改动要保存。</p></div></div>
-  <div class="pg-item"><div class="pg-row"><label class="pg-label" for="refs">参考音目录里的文件</label><select id="refs"><option value="">（点「读目录」）</option></select><p class="pg-hint">从启动参数 --allow-path 的目录里读。挑一个会填进下面表单。</p></div></div>
+  <div class="pg-item"><div class="pg-row"><label class="pg-label" for="refs" id="refs_label">参考音目录里的文件</label><select id="refs"><option value="">（点「读目录」）</option></select><p class="pg-hint">从启动参数 --allow-path 的目录里读。挑一个会填进下面表单。</p></div></div>
 </div>
 
 <div class="pg-pair">
@@ -401,7 +401,8 @@ async function loadRefs() {
     const r = await post("/plugins/voice-gsv/refs", {});
     const items = Array.isArray(r.items) ? r.items : [];
     const sel = $("refs");
-    sel.innerHTML = '<option value="">（' + items.length + ' 个文件）</option>' + items.map(function (it) {
+    $("refs_label").textContent = "参考音目录里的文件（" + items.length + " 个）";
+    sel.innerHTML = '<option value="" disabled selected>（选一个）</option>' + items.map(function (it) {
       const base = String(it.name || "").replace(/[.]wav$/i, "");
       return '<option value="' + esc(it.path) + '" data-base="' + esc(base) + '">' + esc(it.name) + (it.registered ? "（已入库）" : "") + "</option>";
     }).join("");

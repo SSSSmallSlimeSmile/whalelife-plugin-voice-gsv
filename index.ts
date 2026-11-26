@@ -6,7 +6,7 @@
  * 合成地址与参考音沿用原先两个插件里调好的参数，字段名跟 api_v2 一致，gsv.cpp 也认。
  */
 import type { Context } from "../../core/context.ts";
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, writeFile, open, readdir, stat } from "node:fs/promises";
 import { createConnection } from "node:net";
@@ -99,14 +99,15 @@ function replyJson(res: any, code: number, body: any) {
 let CURRENT_PLAY: any = null;
 
 function playFile(file: string): Promise<void> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const child = execFile(
       "powershell.exe",
       ["-NoProfile", "-Command", `(New-Object System.Media.SoundPlayer '${file}').PlaySync()`],
       { windowsHide: true, timeout: 180_000 },
-      () => {
+      (error) => {
         if (CURRENT_PLAY === child) CURRENT_PLAY = null;
-        resolve();
+        if (error) reject(new Error(`播放失败：${error.message}`));
+        else resolve();
       },
     );
     CURRENT_PLAY = child;
@@ -118,11 +119,14 @@ function stopPlayback() {
   const child = CURRENT_PLAY;
   CURRENT_PLAY = null;
   if (!child) return false;
+  // 只调 child.kill() 在这台机器上实测杀不掉——进程表里那句 PlaySync 还活着，
+  // 新的一句上来就变成两句叠着响。改走 taskkill /T /F，连子树一起。
   try {
-    child.kill();
+    if (child.pid) execFileSync("taskkill.exe", ["/T", "/F", "/PID", String(child.pid)], { windowsHide: true, timeout: 8_000, stdio: "ignore" });
+    else child.kill();
     return true;
   } catch {
-    return false;
+    try { child.kill(); return true; } catch { return false; }
   }
 }
 
@@ -142,10 +146,10 @@ function portOpen(port: number, host = "127.0.0.1", timeoutMs = 800): Promise<bo
 }
 
 /** 按端口找 PID。netstat 是系统自带的，不依赖 PowerShell 编码。 */
-function pidByPort(port: number): Promise<number[]> {
-  return new Promise((resolve) => {
-    execFile("netstat.exe", ["-ano", "-p", "TCP"], { windowsHide: true, timeout: 15_000 }, (err, stdout) => {
-      if (err || !stdout) return resolve([]);
+function pidByPort(port: number, timeout = 15_000): Promise<number[]> {
+  return new Promise((resolve, reject) => {
+    execFile("netstat.exe", ["-ano", "-p", "TCP"], { windowsHide: true, timeout }, (err, stdout) => {
+      if (err || !stdout.trim()) return reject(new Error(`无法确认端口 ${port} 的监听进程：${err?.message ?? "netstat 没有输出"}`));
       const pids = new Set<number>();
       for (const line of stdout.split(/\r?\n/)) {
         const cols = line.trim().split(/\s+/);
@@ -193,7 +197,7 @@ function sidecarPlan(cfg: GsvConfig) {
 
 async function gsvStatus(cfg: GsvConfig) {
   const open = await portOpen(cfg.port, cfg.host);
-  const pids = open ? await pidByPort(cfg.port) : [];
+  const pids = open ? await pidByPort(cfg.port).catch(() => []) : [];
   const plan = sidecarPlan(cfg);
   const sidecarOpen = plan.port ? await portOpen(plan.port, cfg.host) : false;
   return { open, pids, sidecar: { port: plan.port, open: sidecarOpen, ready: Boolean(plan.exe && plan.script) } };
@@ -289,15 +293,14 @@ async function killPort(port: number, match: ((name: string) => boolean) | null)
   for (const pid of targets) {
     execFile("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { windowsHide: true }, () => {});
   }
-  if (targets.length) {
-    const deadline = Date.now() + 5000;
-    while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 200));
-      if (!(await pidByPort(port)).length) break;
-    }
+  const deadline = Date.now() + 5000;
+  while (targets.length && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, Math.min(200, deadline - Date.now())));
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    if (!(await pidByPort(port, remaining)).length) return { stopped: true, pids: targets, refused };
   }
-  const after = targets.length ? await pidByPort(port) : pids;
-  return { stopped: targets.length > 0 && after.length === 0, pids: targets, refused };
+  return { stopped: false, pids: targets, refused };
 }
 
 /** 引擎和文本前端都停。两个端口各杀一次，主引擎先走。映像名对不上的拒绝动。 */
@@ -318,9 +321,12 @@ async function gsvStop(cfg: GsvConfig) {
 /** 停服务的回执：杀掉的、被拒绝的都写出来，不把「没动」说成「已结束」。 */
 function stopMessage(r: { stopped: boolean; pids: number[]; refused: { pid: number; name: string; port: number }[] }, cfg: GsvConfig) {
   const parts: string[] = [];
-  if (r.pids.length) parts.push(`已结束：${r.pids.join(", ")}`);
-  for (const one of r.refused) parts.push(`端口 ${one.port} 上的 ${one.pid} 是「${one.name}」，不是我们的程序，没动它`);
-  if (!parts.length) return `端口 ${cfg.port} 上没有进程，没什么可停的`;
+  if (r.pids.length) parts.push(`已尝试结束 PID ${r.pids.join(", ")}。${r.stopped ? "至少一个目标端口已确认释放" : "未确认目标端口释放"}`);
+  for (const one of r.refused) parts.push(`端口 ${one.port} 上的 PID ${one.pid}（${one.name}）未通过进程识别，未结束`);
+  if (!parts.length) {
+    const ports = [...new Set([cfg.port, sidecarPlan(cfg).port])];
+    return `端口 ${ports.join("、")} 未发现监听进程，没什么可停的`;
+  }
   return parts.join("；");
 }
 
@@ -396,10 +402,10 @@ export async function apply(ctx: Context) {
     stopPlayback();
   }
 
-  /** 等正在跑的那轮收手。超时就不等了，免得一个卡死的合成把新的一句堵住。 */
-  async function waitIdle(ms = 4000) {
+  /** 等当前持有者收手，同时让更新的请求淘汰正在等待的请求。 */
+  async function waitIdle(mine: number, ms = 4000) {
     const deadline = Date.now() + ms;
-    while (busy && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+    while (busy && mine === gen && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
   }
 
   function pump() {
@@ -428,31 +434,27 @@ export async function apply(ctx: Context) {
    * 于是「1、改代码」这种中文顿号直接接字的写法漏判了——整条清单被当成正文念。
    */
   const LIST_LINE = /^(?:[-*+•·](?:\s|$)|\d{1,2}[.)](?:\s|$)|\d{1,2}、)/;
-
-  function startsListLine(block: string): boolean {
-    const first = block.split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? "";
-    return LIST_LINE.test(first);
-  }
+  const RULE_LINE = /^(?:(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,})$/;
 
   /**
    * 取回复的第一段。空行分段，跳过只有代码/表格的块；开头是清单就跳过清单、念清单后面那段正文。
    * 一段都取不到返回空串。
    */
   function leadParagraph(input: string): string {
+    let inList = false;
     for (const block of String(input ?? "").split(/\n\s*\n/)) {
-      let body = block;
-      if (startsListLine(block)) {
-        // 念一段清单不叫「开头第一段」，把列表行剥掉，剩下的正文才念；剥不出东西就往后找
-        body = block
-          .split(/\r?\n/)
-          .filter((line) => {
-            const t = line.trim();
-            if (!t) return false;
-            return !LIST_LINE.test(t);
-          })
-          .join("\n");
-        if (!body.trim()) continue;
+      const lines = block.split(/\r?\n/);
+      const first = lines.find((line) => line.trim() && !RULE_LINE.test(line.trim()));
+      if (first === undefined) {
+        inList = false;
+        continue;
       }
+      inList = LIST_LINE.test(first.trim()) || (inList && /^(?: {2}|\t)/.test(first));
+      const body = lines.filter((line) => {
+        const trimmed = line.trim();
+        if (RULE_LINE.test(trimmed)) return false;
+        return !inList || (!LIST_LINE.test(trimmed) && !/^\s/.test(line));
+      }).join("\n");
       const clean = forSpeech(body, cfg.pronounce_keep).trim();
       if (!clean) continue;
       const meat = clean.replace(/代码略|表格略/g, "").replace(/[\s\p{P}\p{S}]/gu, "");
@@ -466,9 +468,6 @@ export async function apply(ctx: Context) {
     if (cfg.interrupt_reading && (busy || queue.length)) {
       // 勾了「新的顶掉旧的」：掐掉正在念的，排队的也一起清，然后只念这一句
       cancelSpeech();
-      queue.push(text);
-      void waitIdle().then(() => pump());
-      return;
     }
     if (queue.length >= 2) queue.shift();
     queue.push(text);
@@ -854,13 +853,27 @@ export async function apply(ctx: Context) {
     }
     const buf = await synth(text, speed, voiceName);
     const file = await saveWav(buf);
-    if (wantPlay) await playFile(file).catch(() => {});
+    if (wantPlay) await playFile(file);
     return file;
   }
 
   /** 长文：清洗、分段、逐段合成播放。 */
   async function speakText(rawText: string) {
+    const mine = gen;
+    const check = () => {
+      if (mine !== gen) throw new Error(CANCELLED);
+    };
+    const playSegment = async (buf: Buffer) => {
+      const file = await saveWav(buf);
+      check();
+      try {
+        await playFile(file);
+      } finally {
+        check();
+      }
+    };
     await reload();
+    check();
     const engine = String(cfg.engine || "local");
     if (engine === "local" && !resolveVoice(cfg).ref_audio) throw new Error("没配参考音频，念不了");
     const clean = forSpeech(rawText, cfg.pronounce_keep);
@@ -871,15 +884,12 @@ export async function apply(ctx: Context) {
     if (meat.length < 2 && /代码略|表格略/.test(clean)) throw new Error("这段只有代码和表格，没什么可念的");
     const parts = splitForSpeech(clean, Number(cfg.max_chars) || 110);
     await mkdir(cfg.out_dir, { recursive: true });
+    check();
     const started = Date.now();
     // 句子级流水：先把第一句合成出来，开始播的时候第二句已经在合成。
     // 等待从「每句都等」变成「只等第一句」，接缝是一个完整的 wav 顺序播，
     // 不做波形拼接——那样容易把头写坏，也不做交叉淡化。
     const piped = cfg.pipe_sentences !== false && parts.length > 1;
-    const mine = gen;
-    const check = () => {
-      if (mine !== gen) throw new Error(CANCELLED);
-    };
     if (piped) {
       const take = (text: string) => synth(text).then((buf) => ({ buf } as const), (error) => ({ error } as const));
       let pending = take(parts[0]);
@@ -889,16 +899,17 @@ export async function apply(ctx: Context) {
         if ("error" in now) throw now.error;
         if (i + 1 < parts.length) pending = take(parts[i + 1]);
         check();
-        await playFile(await saveWav(now.buf));
+        await playSegment(now.buf);
       }
     } else {
       for (const part of parts) {
         check();
         const buf = await synth(part);
         check();
-        await playFile(await saveWav(buf));
+        await playSegment(buf);
       }
     }
+    check();
     return {
       ok: true,
       segments: parts.length,
@@ -1003,12 +1014,12 @@ export async function apply(ctx: Context) {
     description: "按端口找 PID 并结束语音服务进程（连子进程一起）。",
     schema: { type: "object", properties: {} },
     danger: "ask",
-    run: async () => {
+    run: safe(async () => {
       await reload();
       const r = await gsvStop(g);
       referSync = { ok: false, at: 0, key: "", error: "引擎已停" };
       return stopMessage(r, g);
-    },
+    }),
   });
 
   // ── 网页 ──────────────────────────────────────────────
@@ -1094,7 +1105,10 @@ export async function apply(ctx: Context) {
         if (cfg.interrupt_reading) {
           // 勾了「新的顶掉旧的」：掐掉再念，不返回 409
           cancelSpeech();
-          await waitIdle();
+          const mine = gen;
+          await waitIdle(mine);
+          if (mine !== gen) throw new Error(CANCELLED);
+          if (busy) return replyJson(res, 503, { ok: false, error: "上一段仍在收尾，请稍后再试" });
         } else {
           ctx.logger?.warn?.("念话请求", { status: "busy", chars: text.length });
           return replyJson(res, 409, { ok: false, error: "上一段还在念，等它念完" });
@@ -1108,9 +1122,9 @@ export async function apply(ctx: Context) {
         return replyJson(res, 200, r);
       } finally {
         busy = false;
+        if (queue.length) pump();
       }
     } catch (error: any) {
-      busy = false;
       const msg = String(error?.message ?? error);
       if (msg === CANCELLED) return replyJson(res, 200, { ok: false, cancelled: true, error: "这一段被新的一句顶掉了" });
       ctx.logger?.warn?.("念话请求", { status: "fail", error: msg });
@@ -1127,7 +1141,10 @@ export async function apply(ctx: Context) {
       if (busy || queue.length) {
         if (cfg.interrupt_reading) {
           cancelSpeech();
-          await waitIdle();
+          const mine = gen;
+          await waitIdle(mine);
+          if (mine !== gen) throw new Error(CANCELLED);
+          if (busy) return replyJson(res, 503, { ok: false, error: "上一段仍在收尾，请稍后再试" });
         } else return replyJson(res, 409, { ok: false, error: "上一段还在念，等它念完" });
       }
       busy = true;
@@ -1136,9 +1153,10 @@ export async function apply(ctx: Context) {
         return replyJson(res, 200, { ...r, text: `念完了：${r.segments} 段，${r.chars} 字，用时 ${(r.ms / 1000).toFixed(1)} 秒。` });
       } finally {
         busy = false;
+        if (queue.length) pump();
       }
     } catch (error: any) {
-      busy = false;
+      if (error?.message === CANCELLED) return replyJson(res, 200, { ok: false, cancelled: true, error: "这一段被新的一句顶掉了" });
       return replyJson(res, 500, { ok: false, error: error?.message ?? String(error) });
     }
   });
@@ -1297,8 +1315,12 @@ export async function apply(ctx: Context) {
 
   if (g.stop_on_exit) {
     ctx.on("whalelife/shutdown", async () => {
-      const r = await gsvStop(g);
-      ctx.logger.info(r.stopped ? `GSV 已随主程序结束：${r.pids.join(", ")}` : "GSV 本来就停着");
+      try {
+        const r = await gsvStop(g);
+        ctx.logger.info(stopMessage(r, g));
+      } catch (error: any) {
+        ctx.logger.warn(`GSV 停止状态无法确认：${error?.message ?? error}`);
+      }
     });
   }
 
