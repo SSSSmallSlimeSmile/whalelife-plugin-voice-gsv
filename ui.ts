@@ -79,6 +79,18 @@ export function sanitize(input: any): { top: Record<string, unknown>; gsv: Recor
     const n = Number(src.sample_steps);
     if (Number.isFinite(n)) top.sample_steps = Math.min(32, Math.max(0, Math.round(n)));
   }
+  if ("pronounce_keep" in src) {
+    const raw = (src as any).pronounce_keep;
+    const list = Array.isArray(raw) ? raw : String(raw ?? "").split(/[,，;；\s]+/);
+    const seen: string[] = [];
+    for (const one of list) {
+      const word = String(one ?? "").trim();
+      if (!word || !/^[A-Za-z0-9_.+\-]{1,24}$/.test(word) || seen.includes(word)) continue;
+      seen.push(word);
+      if (seen.length >= 40) break;
+    }
+    top.pronounce_keep = seen;
+  }
   if ("max_chars" in src) {
     const n = Number(src.max_chars);
     if (Number.isFinite(n)) top.max_chars = Math.min(200, Math.max(40, Math.round(n)));
@@ -89,6 +101,8 @@ export function sanitize(input: any): { top: Record<string, unknown>; gsv: Recor
     else if (/^tts:[A-Za-z0-9_.-]{1,64}$/.test(value)) top.engine = value;
   }
   if ("sync_default_refer" in src) top.sync_default_refer = bool(src.sync_default_refer);
+  if ("pipe_sentences" in src) top.pipe_sentences = bool(src.pipe_sentences);
+  if ("interrupt_reading" in src) top.interrupt_reading = bool(src.interrupt_reading);
   if ("auto_read" in src) top.auto_read = bool(src.auto_read);
   if ("auto_scope" in src) {
     const value = text(src.auto_scope).toLowerCase();
@@ -276,9 +290,11 @@ export function renderPage(cfg: any, status: any = {}, ttsList: any[] = []): str
 
 <div class="pg-pair">
   <div class="pg-item"><div class="pg-row"><label class="pg-label" for="url">合成地址</label><input type="text" id="url" value="${esc(c.url)}"><p class="pg-hint">默认 http://127.0.0.1:9880，端口要和「引擎」那页的「端口」一致。</p></div></div>
-  <div class="pg-item"><div class="pg-row"><label class="pg-label" for="max_chars">每段最多几个字</label><input type="number" id="max_chars" step="10" min="40" max="200" value="${esc(c.max_chars)}"><p class="pg-hint">太长容易读出怪音，一般 110 就够。</p></div></div>
+  <div class="pg-item"><div class="pg-row"><label class="pg-label" for="max_chars">每段最多几个字</label><input type="number" id="max_chars" step="10" min="40" max="200" value="${esc(c.max_chars)}"><p class="pg-hint">太长容易读出怪音，一般 110 就够。</p></div></div><div class="pg-item"><div class="pg-row"><label class="pg-label" for="pronounce_keep">这些词原样念，不改中文</label><input type="text" id="pronounce_keep" value="${esc((Array.isArray(c.pronounce_keep) ? c.pronounce_keep : []).join(", "))}" placeholder="GB, MB, KB"><p class="pg-hint">中英混排时数字和字母会被读成中文（4.3 GB → 四点三吉字节）。列在这里的词原样交给引擎按英文念，逗号分隔；清空就全用中文读法。</p></div></div>
 </div>
 
+<div class="pg-item"><div class="pg-row"><div class="pg-check"><input type="checkbox" id="pipe_sentences"${c.pipe_sentences !== false ? " checked" : ""}><label class="pg-label" for="pipe_sentences">句子级流水（长文先出声）</label></div><p class="pg-hint">勾上后：第一句合成完就开始播，播的时候下一句已经在合成——等待从「每句都等」变成「只等第一句」。每句仍是完整的 wav 顺序播放，不做波形拼接。关掉就退回「合成一句、播一句」的串行。</p></div></div>
+<div class="pg-item"><div class="pg-row"><div class="pg-check"><input type="checkbox" id="interrupt_reading"${c.interrupt_reading === true ? " checked" : ""}><label class="pg-label" for="interrupt_reading">新的顶掉旧的</label></div><p class="pg-hint">勾上后：新的一段念话进来，正在念的那句当场掐掉，排队的也一起清，只念新的这一段。不勾就排队——正在念的照样念完，队列满了（两条）才丢最老的那条。</p></div></div>
 <div class="pg-item"><div class="pg-row"><div class="pg-check"><input type="checkbox" id="sync_default_refer"${c.sync_default_refer !== false ? " checked" : ""}><label class="pg-label" for="sync_default_refer">自动把当前音色设成引擎默认</label></div><p class="pg-hint">勾上后：启动服务或第一次念话时，先让引擎记住这套参考音，之后念话不再传音频路径和对应文本（少两个逐字要对上的字段）。引擎重启会丢，插件会重设一次；关掉它就每轮都带着传。</p></div></div>
 </section>
 
@@ -304,7 +320,6 @@ export function renderPage(cfg: any, status: any = {}, ttsList: any[] = []): str
 <div class="pg-pair">
   <div class="pg-item"><div class="pg-row"><label class="pg-label" for="ref_audio">参考音频</label><input type="text" id="ref_audio" value="${esc(c.ref_audio)}"><p class="pg-hint">念的时候照着这个音色。留空则不念。目录要在启动参数 --allow-path 里。</p></div></div>
   <div class="pg-item"><div class="pg-row"><label class="pg-label" for="prompt_text">参考音频对应文本</label><input type="text" id="prompt_text" value="${esc(c.prompt_text)}"><p class="pg-hint">要跟上面的音频逐字对应，写错了音色会飘。</p></div></div>
-</div>
 </div>
 <div class="pg-result" id="ref_report" hidden></div>
 </section>
@@ -607,6 +622,8 @@ async function saveAll() {
     top: {
       enabled: $("enabled").checked,
       sync_default_refer: $("sync_default_refer").checked,
+      pipe_sentences: $("pipe_sentences").checked,
+      interrupt_reading: $("interrupt_reading").checked,
       auto_read: $("auto_read").checked,
       auto_scope: $("auto_scope").value,
       engine: $("engine").value,
@@ -619,6 +636,7 @@ async function saveAll() {
     voice: $("voice").value,
     sample_steps: $("sample_steps").value,
       max_chars: $("max_chars").value,
+      pronounce_keep: $("pronounce_keep").value,
       cloud_key: $("cloud_key").value,
       cloud_voice: $("cloud_voice").value,
     },
