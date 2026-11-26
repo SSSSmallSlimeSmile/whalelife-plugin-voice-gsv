@@ -366,6 +366,16 @@ export function renderPage(cfg: any, status: any = {}, ttsList: any[] = []): str
 <div class="pg-pair">
   <div class="pg-item"><div class="pg-row"><label class="pg-label" for="start_wait_ms">等待就绪上限（毫秒）</label><input type="number" id="start_wait_ms" step="1000" min="10000" max="600000" value="${esc(g.start_wait_ms)}"><p class="pg-hint">只在需要「等它真起来」时用，默认 180 秒。</p></div></div>
 </div>
+
+<p class="pg-sub">部署检查（换台机器、或给别人装的时候用）</p>
+<div class="pg-item">
+  <div class="pg-row"><label class="pg-label" for="dep_root">解包根目录</label><input type="text" id="dep_root" placeholder="...\GSV（它下面应该是 runtime\gsv\gsv_server.exe）"><p class="pg-hint">留空就从上面的「引擎程序」往上推三级。「检查」只读——不下载、不写盘、不改配置。</p></div>
+  <div class="pg-btns" style="margin:8px 0 0"><button class="btn" type="button" id="dep_check">检查缺什么</button><button class="btn" type="button" id="dep_engine">下载引擎（15 MB）</button></div>
+  <div class="pg-row" style="margin-top:8px"><label class="pg-label" for="dep_zip">本地安装包</label><input type="text" id="dep_zip" placeholder="...\GSV.CPP-win64-0.1.0.zip"><p class="pg-hint">3.4G 的完整包不在 GitHub 上，插件下不了。自己下好后把完整路径填这里，点下面那个按钮校验并解压（完整包自带 runtime 那一层，解到根目录就行）。</p></div>
+  <div class="pg-btns" style="margin:8px 0 0"><button class="btn" type="button" id="dep_hash">只算这个包的 sha256</button><button class="btn" type="button" id="dep_local">从本地包安装</button></div>
+  <div class="pg-result wait" id="dep_out" hidden></div>
+  <p class="pg-hint">「下载引擎」下的只是 GitHub release 上那个 15 MB 的 win64 包——exe 加三个 ggml dll，解到 <根目录>\runtime\gsv。sidecar、python、模型、音色全都不在里面，下完再点「检查缺什么」还是亮的。断点续传：中断了就再点一次，会从 .part 接着下；sha256 对不上会自动删掉那份分片。</p>
+</div>
 </section>
 
 <section class="pg-pg" id="pg-cloud" hidden>
@@ -638,6 +648,97 @@ async function openFolder(which) {
 }
 $("open_voices").onclick = () => { openFolder("voices"); };
 $("open_models").onclick = () => { openFolder("root"); };
+
+// 部署检查：缺哪件说哪件。只读，不下载。
+function depOut(kind, lines) {
+  var box = $("dep_out");
+  box.hidden = false;
+  box.className = "pg-result " + kind;
+  box.textContent = "";
+  (lines || []).forEach(function (one) {
+    var line = document.createElement("div");
+    line.textContent = one;
+    box.appendChild(line);
+  });
+}
+async function depCheck() {
+  depOut("wait", ["正在查…"]);
+  try {
+    var r = await post("/plugins/voice-gsv/deploy/check", { root: $("dep_root").value.trim() });
+    if (!r.root) return depOut("err", [r.reason || "推不出解包根目录，把上面的路径填上。"]);
+    var lines = [(r.ok ? "齐了。" : "缺 " + r.missing + " 项。") + "根目录：" + r.root];
+    (r.items || []).forEach(function (it) {
+      var bad = it.bytes === null || it.bytes < it.need;
+      lines.push((bad ? "✗ " : "✓ ") + it.key + (it.bytes === null ? " 不在" : " " + Math.round(it.bytes / 1048576) + " MB") + (it.note ? "（" + it.note + "）" : ""));
+    });
+    lines.push(r.voices && r.voices.length ? "音色：" + r.voices.join("、") : "音色：一套都没有（voices\<名字>\manifest.json）");
+    depOut(r.ok ? "ok" : "err", lines);
+  } catch (error) {
+    depOut("err", ["检查失败：" + (error && error.message ? error.message : error)]);
+  }
+}
+var depTimer = null;
+function depStop() {
+  if (depTimer) { clearTimeout(depTimer); depTimer = null; }
+}
+function depWatch() {
+  depStop();
+  depTimer = setTimeout(async function () {
+    try {
+      var r = await post("/plugins/voice-gsv/deploy/status", {});
+      var j = r.job;
+      if (!j) return depOut("wait", ["还没起过部署任务。"]);
+      var pct = j.total ? Math.floor((j.bytes / j.total) * 100) : null;
+      var phase = { download: "下载中", verify: "校验中", extract: "解压中", done: "完成", failed: "失败" }[j.phase] || j.phase;
+      var lines = [phase + (pct === null ? "" : " " + pct + "%") + " · " + Math.round(j.bytes / 1048576) + (j.total ? " / " + Math.round(j.total / 1048576) : "") + " MB"];
+      lines.push("文件：" + j.dest);
+      lines.push("解到：" + j.root);
+      if (j.error) lines.push("原因：" + j.error);
+      depOut(j.phase === "failed" ? "err" : j.phase === "done" ? "ok" : "wait", lines);
+      if (j.phase === "done" || j.phase === "failed") { depStop(); if (j.phase === "done") depCheck(); return; }
+      depWatch();
+    } catch (error) {
+      depOut("err", ["查进度失败：" + (error && error.message ? error.message : error)]);
+      depWatch();
+    }
+  }, 1500);
+}
+$("dep_check").onclick = function () { depCheck(); };
+$("dep_engine").onclick = async function () {
+  if (!confirm("下载 gsv.cpp 引擎（约 15 MB，只有 exe 和三个 ggml dll，不含 sidecar / python / 模型）并解压？")) return;
+  try {
+    var r = await post("/plugins/voice-gsv/deploy/start", { root: $("dep_root").value.trim(), mode: "engine" });
+    depOut("wait", ["已开始：" + r.id, "解到：" + r.root, r.note || ""]);
+    depWatch();
+  } catch (error) {
+    depOut("err", ["起不来：" + (error && error.message ? error.message : error)]);
+  }
+};
+$("dep_hash").onclick = async function () {
+  var zip = $("dep_zip").value.trim();
+  if (!zip) return depOut("err", ["先填本地包路径。"]);
+  depOut("wait", ["正在算，大包要一会儿…"]);
+  try {
+    var r = await post("/plugins/voice-gsv/deploy/hash", { zip: zip });
+    depOut("ok", [r.path, Math.round(r.bytes / 1048576) + " MB", "sha256 " + r.sha256]);
+  } catch (error) {
+    depOut("err", ["算不出来：" + (error && error.message ? error.message : error)]);
+  }
+};
+$("dep_local").onclick = async function () {
+  var zip = $("dep_zip").value.trim();
+  if (!zip) return depOut("err", ["先填本地包路径。"]);
+  if (!confirm("把 " + zip + " 解压到根目录？同名文件会被覆盖。")) return;
+  try {
+    var r = await post("/plugins/voice-gsv/deploy/start", { root: $("dep_root").value.trim(), mode: "local", zip: zip });
+    depOut("wait", ["已开始：" + r.id, "解到：" + r.root]);
+    depWatch();
+  } catch (error) {
+    depOut("err", ["起不来：" + (error && error.message ? error.message : error)]);
+  }
+};
+
+
 $("del_voice").onclick = async () => {
   const name = $("voice_name").value;
   if (!name) return show("err", "先在上面选一个音色。");

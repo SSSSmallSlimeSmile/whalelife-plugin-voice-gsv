@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { readBody, renderPage, sanitize } from "./ui.ts";
 import { probeVoices } from "./voices.ts";
 import { forSpeech, splitForSpeech, fixWavHeader, joinUrl, KEEP_DEFAULT } from "./speech.ts";
+import { checkDeploy, deployStatus, hashLocal, rootFromExe, startInstall, ENGINE_ASSET } from "./deploy.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -951,7 +952,7 @@ export async function apply(ctx: Context) {
     await reload();
     check();
     const engine = String(cfg.engine || "local");
-    if (engine === "local" && !resolveVoice(cfg).ref_audio) throw new Error("没配参考音频，念不了");
+    if (engine === "local" && !resolveVoice(cfg, voiceName).ref_audio) throw new Error("没配参考音频，念不了");
     const clean = forSpeech(rawText, cfg.pronounce_keep, cfg.pronounce_cn);
     if (!clean) throw new Error("这段话过滤后没什么可念的");
     // 只在「清洗后只剩代码/表格占位」时才拒念。原来的门槛是剩余字数 < 6，
@@ -1032,7 +1033,7 @@ export async function apply(ctx: Context) {
           if (mine !== gen) throw new Error(CANCELLED);
           if (busy) {
             enqueuePending(text, args?.speed, args?.voice);
-            return `已排队：${text.slice(0, 40)}${text.length > 40 ? "…" : ""}\n上一段还在收尾，这句排在它后面念。这一句没有播放入口标记——声音会出来，但页面上不会有播放器。${warn ? "\n注意：" + warn : ""}`;
+            return `已排队：${text.slice(0, 40)}${text.length > 40 ? "…" : ""}\n上一段还在收尾，轮到这一句且合成成功时会在本机播放。后续请求可能将它顶掉。这次回执没有播放入口标记。${warn ? "\n注意：" + warn : ""}`;
           }
         } else throw new Error("上一段还在念，等它念完再试");
       }
@@ -1408,6 +1409,56 @@ export async function apply(ctx: Context) {
       const msg = error?.name === "AbortError" ? "引擎 6 秒没回话，可能没起或者卡住了。" : error?.message ?? String(error);
       return replyJson(res, 200, { ok: false, error: msg });
     }
+  });
+
+  // ── 部署：检查 + 安装 ──────────────────────────────────
+  // 给别人的那一半。缺哪件说哪件；能自动下的只有 GitHub 上那个 15MB 的引擎包，
+  // 3.4G 的模型不在那儿，插件不下、也不假装能下——只把清单摊出来。
+  ctx.web.api("/plugins/voice-gsv/deploy/check", async (req: any, res: any) => {
+    try {
+      await reload();
+      const body: any = await readBody(req);
+      const root = String(body?.root ?? "").trim();
+      const report = await checkDeploy({ exe: String(g.exe ?? ""), root });
+      return replyJson(res, 200, report);
+    } catch (error: any) {
+      return replyJson(res, 500, { ok: false, error: error?.message ?? String(error) });
+    }
+  });
+
+  ctx.web.api("/plugins/voice-gsv/deploy/hash", async (req: any, res: any) => {
+    try {
+      const body: any = await readBody(req);
+      const zip = String(body?.zip ?? "").trim();
+      if (!zip) return replyJson(res, 400, { ok: false, error: "缺少本地包路径" });
+      return replyJson(res, 200, { ok: true, ...(await hashLocal(zip)) });
+    } catch (error: any) {
+      return replyJson(res, 400, { ok: false, error: error?.message ?? String(error) });
+    }
+  });
+
+  ctx.web.api("/plugins/voice-gsv/deploy/start", async (req: any, res: any) => {
+    try {
+      await reload();
+      const body: any = await readBody(req);
+      const root = String(body?.root ?? "").trim() || rootFromExe(String(g.exe ?? ""));
+      if (!root) return replyJson(res, 400, { ok: false, error: "先填解包根目录，或者填好引擎程序让它能推出来" });
+      if (String(body?.mode ?? "engine") === "engine") {
+        const into = join(root, "runtime", "gsv");
+        const r = startInstall({ url: ENGINE_ASSET.url, sha256: ENGINE_ASSET.sha256, root, into, extract: true });
+        return replyJson(res, 200, { ok: true, mode: "engine", ...r, note: "这个包只有 exe 和三个 ggml dll；sidecar、python、模型都不在里面，下完还得自己放" });
+      }
+      const zip = String(body?.zip ?? "").trim();
+      if (!zip) return replyJson(res, 400, { ok: false, error: "本地安装要给出 zip 的完整路径" });
+      const r = startInstall({ zip, sha256: String(body?.sha256 ?? "").trim() || undefined, root, extract: true });
+      return replyJson(res, 200, { ok: true, mode: "local", ...r });
+    } catch (error: any) {
+      return replyJson(res, 400, { ok: false, error: error?.message ?? String(error) });
+    }
+  });
+
+  ctx.web.api("/plugins/voice-gsv/deploy/status", async (_req: any, res: any) => {
+    return replyJson(res, 200, { ok: true, job: deployStatus(), engine: ENGINE_ASSET });
   });
 
   // ── 伴随行为 ──────────────────────────────────────────
