@@ -87,7 +87,7 @@ const safe = <A, S>(fn: (args: A, session: S) => Promise<unknown> | unknown) =>
 async function hasEar(tools: any): Promise<boolean> {
   try {
     const list = (await tools.list()) as any[];
-    return Array.isArray(list) && list.some((one) => String(one?.name ?? "").startsWith("ear_"));
+    return Array.isArray(list) && list.some((one) => String(one?.function?.name ?? one?.name ?? "").startsWith("ear_"));
   } catch {
     return false;
   }
