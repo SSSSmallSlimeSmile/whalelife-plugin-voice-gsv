@@ -26,6 +26,8 @@ const REQUIRED: { rel: string; need: number; note?: string }[] = [
   { rel: "runtime/gsv/gsv_server.exe", need: 1_000_000 },
   { rel: "runtime/gsv/ggml-vulkan.dll", need: 1_000_000 },
   { rel: "runtime/gsv/ggml.dll", need: 10_000 },
+  { rel: "runtime/gsv/ggml-base.dll", need: 10_000 },
+  { rel: "runtime/gsv/ggml-cpu.dll", need: 10_000 },
   { rel: "runtime/frontend/text_sidecar.py", need: 1_000 },
   { rel: "runtime/python/python.exe", need: 10_000, note: "文本前端要用的 python" },
   { rel: "runtime/models/gsv-ar-q8.gguf", need: 50_000_000 },

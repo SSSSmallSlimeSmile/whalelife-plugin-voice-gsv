@@ -168,15 +168,17 @@ export function sanitize(input: any): { top: Record<string, unknown>; gsv: Recor
 const STYLE = `
 .panel-body .pg-row{display:block;margin:0}
 .panel-body .pg-label{display:block!important;font-size:15px!important;font-weight:700!important;color:inherit;margin:0 0 10px;line-height:1.45}
-.panel-body .pg-row input[type=text],.panel-body .pg-row input[type=password],.panel-body .pg-row input[type=number],.panel-body .pg-row select{display:block;width:100%;box-sizing:border-box;padding:10px 13px;font-size:14px;line-height:1.4;border-radius:8px;border:1px solid rgba(127,127,127,.35);background:transparent;color:inherit;font-family:inherit}
-.panel-body .pg-row input:focus,.panel-body .pg-row select:focus{outline:none;border-color:#7c5cff;box-shadow:0 0 0 3px rgba(124,92,255,.12)}
+.panel-body .pg-row input[type=text],.panel-body .pg-row input[type=password],.panel-body .pg-row input[type=number],.panel-body .pg-row select,.panel-body .pg-row textarea{display:block;width:100%;box-sizing:border-box;padding:10px 13px;font-size:14px;line-height:1.4;border-radius:8px;border:1px solid rgba(127,127,127,.35);background:transparent;color:inherit;font-family:inherit}
+.panel-body .pg-row input:focus,.panel-body .pg-row select:focus,.panel-body .pg-row textarea:focus{outline:none;border-color:#7c5cff;box-shadow:0 0 0 3px rgba(124,92,255,.12)}
 .panel-body .pg-row input:disabled,.panel-body .pg-row select:disabled{opacity:.55;cursor:not-allowed}
 .panel-body .pg-check{display:flex!important;align-items:center;gap:10px}
 .panel-body .pg-check .pg-label{margin:0}
 .panel-body .pg-pair{display:grid;grid-template-columns:1fr 1fr;column-gap:36px;margin:0 0 30px}
 .panel-body .pg-pair>.pg-item:only-child{grid-column:1/-1}
 .panel-body .pg-item{min-width:0}
-.panel-body .pg-hint{margin:10px 0 0;font-size:12px;line-height:1.65;color:#797e8c}
+.panel-body .pg-hint{margin:10px 0 0;font-size:13.5px;line-height:1.72;color:#6e7481}
+.panel-body .pg-hint a{color:#6d4aff;font-weight:600;text-decoration:underline;text-underline-offset:2px}
+.panel-body .pg-hint a:hover{color:#5a37e8}
 .pg-actions{display:flex;align-items:center;gap:12px;margin-left:auto}
 .pg-state{margin:0 0 22px;padding:14px 16px;border-radius:10px;font-size:14px;line-height:1.7;border:1px solid transparent}
 .pg-state.on{background:rgba(5,150,105,.10);border-color:rgba(5,150,105,.35);color:#047857}
@@ -186,7 +188,7 @@ const STYLE = `
 .pg-result.ok{background:rgba(5,150,105,.10);border-color:rgba(5,150,105,.35);color:#047857}
 .pg-result.err{background:rgba(220,38,38,.10);border-color:rgba(220,38,38,.35);color:#b91c1c}
 .pg-tip{margin:0 0 26px;padding:14px 16px;border-radius:10px;font-size:13px;line-height:1.75;background:rgba(124,92,255,.08);border:1px solid rgba(124,92,255,.25);color:#6d4aff}
-.pg-sub{margin:0 0 14px;font-size:12px;font-weight:700;color:#797e8c;letter-spacing:.06em}
+.pg-sub{margin:0 0 14px;font-size:13px;font-weight:700;color:#6e7481;letter-spacing:.06em}
 .pg-btns{display:flex;gap:12px;flex-wrap:wrap;margin:0 0 10px}
 .pg-hint .btn{margin-left:8px;padding:3px 10px;font-size:12px}
 .pg-tabs{display:flex;gap:4px;flex-wrap:wrap;margin-right:auto}
@@ -241,7 +243,7 @@ export function renderPage(cfg: any, status: any = {}, ttsList: any[] = []): str
   const stateText = open
     ? `在运行（${esc(g.host)}:${esc(g.port)}）${pids ? "，PID：" + esc(pids) : ""}`
     : `没在运行（${esc(g.host)}:${esc(g.port)} 连不上）`;
-  const argsText = Array.isArray(g.args) ? g.args.join(" ") : String(g.args ?? "");
+  const argsText = Array.isArray(g.args) ? g.args.join("\n") : String(g.args ?? "").trim().split(/\s+/).join("\n");
   const engineNow = String(c.engine ?? "local");
   const cloud = engineNow !== "local";
   const fromModel = engineNow.startsWith("tts:");
@@ -360,7 +362,7 @@ export function renderPage(cfg: any, status: any = {}, ttsList: any[] = []): str
 </div>
 
 <div class="pg-pair">
-  <div class="pg-item"><div class="pg-row"><label class="pg-label" for="args">启动参数</label><input type="text" id="args" value="${esc(argsText)}" placeholder="--models ... --device vulkan:0 --host 127.0.0.1 --port 9880"><p class="pg-hint">空格分隔。--allow-path 必须包含参考音所在目录，否则合成会 403。</p></div></div>
+  <div class="pg-item"><div class="pg-row"><label class="pg-label" for="args">启动参数</label><textarea id="args" rows="6" placeholder="--models&#10;C:\\My GSV\\runtime\\models">${esc(argsText)}</textarea><p class="pg-hint">一行一个参数，选项和值各占一行。带空格的路径直接填，无需引号。--allow-path 的值填参考音所在目录。</p></div></div>
   <div class="pg-item"><div class="pg-row"><label class="pg-label" for="log">日志文件</label><input type="text" id="log" value="${esc(g.log)}" placeholder="...\\logs\\gsv_9880.log"><p class="pg-hint">启动失败先看这里，输出是追加的。</p></div></div>
 </div>
 
@@ -377,35 +379,35 @@ export function renderPage(cfg: any, status: any = {}, ttsList: any[] = []): str
 </section>
 
 <section class="pg-pg" id="pg-deploy" hidden>
-<p class="pg-tip">这一页只在「换台机器、或者给别人装」时用。<b>本机已经能念话的话，这一页可以整页不管</b>——十五项全绿就是好的，一个字都不用填。</p>
+<p class="pg-tip">这一页只在「换台机器、或者给别人装」时用。<b>本机已经能念话的话，这一页可以整页不管</b>——十七项全绿就是好的，一个字都不用填。</p>
 
 <p class="pg-sub">先看自己属于哪种</p>
 <div class="pg-item">
-<p class="pg-hint"><b>① 本机已有引擎（现在这种）</b>：点下面 ② 的「检查缺什么」，十五项全绿就完事了，不用装、不用改配置。<br>
+<p class="pg-hint"><b>① 本机已有引擎（现在这种）</b>：点下面 ② 的「检查缺什么」，十七项全绿就完事了，不用装、不用改配置。<br>
 <b>② 换台机器 / 自己重装</b>：手上有那个 3.16 GB 的完整包，走 ③ 填路径 →「看一下这个包」→「从本地包安装」。<br>
-<b>③ 手上什么都没有</b>：只能拿到 14 MB 那个引擎包，里面只有 gsv_server.exe 和两个 ggml dll，sidecar、内嵌 python、七件模型一概没有——等于装了一半。这条现在没有一键全套，别指望。</p>
+<b>③ 手上什么都没有</b>：首次部署请准备完整包。约 15 MB 的独立引擎包只有 gsv_server.exe 和四个 ggml DLL。</p>
 </div>
 
 <p class="pg-sub">① 拿到包</p>
 <div class="pg-item">
-<p class="pg-hint"><a id="dep_dl_engine" href="${ENGINE_ASSET.url}" target="_blank" rel="noreferrer">引擎包（14.4 MB）</a> · <a id="dep_dl_page" href="${ENGINE_RELEASES}" target="_blank" rel="noreferrer">发布页</a> —— 解到 &lt;根目录&gt;\\runtime\\gsv 那一层。包里只有 exe 加两个 ggml dll，缺模型会起不来，日志里会写找不到哪个 gguf。</p>
+<p class="pg-hint"><a id="dep_dl_engine" href="${ENGINE_ASSET.url}" target="_blank" rel="noreferrer">引擎包（约 15 MB）</a> · <a id="dep_dl_page" href="${ENGINE_RELEASES}" target="_blank" rel="noreferrer">发布页</a> —— 解到 &lt;根目录&gt;\\runtime\\gsv 那一层。包里只有 exe 和四个 ggml DLL。</p>
 <p class="pg-hint">完整包 3.16 GB（exe + sidecar + 内嵌 python + 七件模型，解开正好是 runtime\\ 这一层）不在 GitHub，插件下不了——自己去整合包或网盘拿，路径填在 ③。</p>
 <p class="pg-hint">两个链接都只在新标签页打开，插件不替你下、不替你存。</p>
 </div>
 
 <p class="pg-sub">② 解包根目录（先检查，缺什么补什么）</p>
 <div class="pg-item">
-  <div class="pg-row"><label class="pg-label" for="dep_root">根目录</label><input type="text" id="dep_root" placeholder="...\\GSV（它下面应该是 runtime\\gsv\\gsv_server.exe）"><p class="pg-hint">留空就从「引擎」页那个「引擎程序」往上推三级。填错不会弄坏什么，「检查」只读——不下载、不写盘、不改配置。</p></div>
-  <p class="pg-hint">检查看这十五项：<code>gsv_server.exe</code>、<code>ggml-vulkan.dll</code>、<code>ggml.dll</code>、<code>text_sidecar.py</code>、<code>python.exe</code>、七件 gguf（ar / bert / hubert / cond / dit / refcode / vocoder）、<code>g2pW.onnx</code>（中文多音字）、<code>vocab.txt</code>、<code>lid.176.bin</code>（只有 en / auto 才用到）。缺哪件报哪件，带大小，最后单列几套音色。</p>
-  <div class="pg-btns" style="margin:8px 0 0"><button class="btn" type="button" id="dep_check">检查缺什么</button><button class="btn" type="button" id="dep_engine">直接下载引擎包（14 MB）</button></div>
-  <p class="pg-hint">「直接下载引擎包」会下、会校验 sha256、会解压——<b>这一页唯一自己写盘的动作就是它</b>，别跟「检查」混了。断了再点一次会从 .part 接着下；sha256 对不上会自动删掉那份分片，不会留个坏包在那儿。</p>
+  <div class="pg-row"><label class="pg-label" for="dep_root">根目录</label><input type="text" id="dep_root" placeholder="...\\GSV（它下面应该是 runtime\\gsv\\gsv_server.exe）"><p class="pg-hint">请填无引号的绝对路径。留空时，从已保存的「引擎程序」路径往上推三级；若检查显示全缺，先核对报告里的根目录。检查只读取文件信息。</p></div>
+  <p class="pg-hint">检查看这十七项：<code>gsv_server.exe</code>、<code>ggml-vulkan.dll</code>、<code>ggml.dll</code>、<code>ggml-base.dll</code>、<code>ggml-cpu.dll</code>、<code>text_sidecar.py</code>、<code>python.exe</code>、七件 gguf（ar / bert / hubert / cond / dit / refcode / vocoder）、<code>g2pW.onnx</code>（中文多音字）、<code>vocab.txt</code>、<code>lid.176.bin</code>（只有 en / auto 才用到）。缺哪件报哪件，带大小，最后单列几套音色。</p>
+  <div class="pg-btns" style="margin:8px 0 0"><button class="btn" type="button" id="dep_check">检查缺什么</button><button class="btn" type="button" id="dep_engine">直接下载引擎包（约 15 MB）</button></div>
+  <p class="pg-hint">「直接下载引擎包」和「从本地包安装」都会写盘。下载中断后，服务器支持 Range 时会尝试从 .part 续传。SHA-256 不符时会删除分片。</p>
 </div>
 
 <p class="pg-sub">③ 本地包安装（完整包 3.16 GB 走这条）</p>
 <div class="pg-item">
   <div class="pg-row"><label class="pg-label" for="dep_zip">完整包路径</label><input type="text" id="dep_zip" placeholder="...\\GSV.CPP-win64-0.1.0.zip"><p class="pg-hint">zip 的完整路径。<b>先点「看一下这个包」</b>，它会报大小和 sha256，包打不开也当场说；连大小都读不出来就别急着装。</p></div>
   <div class="pg-btns" style="margin:8px 0 0"><button class="btn" type="button" id="dep_hash">看一下这个包</button><button class="btn" type="button" id="dep_local">从本地包安装</button></div>
-  <p class="pg-hint">完整包自带 runtime\\ 那一层，解到根目录就对了。<b>同名文件会被覆盖</b>——装之前确认根目录没指着正在用的那套，或者先备份。音色文件被覆盖成别的东西，引擎不会报错，只会在合成时用错音色。</p>
+  <p class="pg-hint">请使用顶层含 runtime\\ 的完整 ZIP。安装会覆盖同名文件，装之前请确认目标路径并备份。中途解压失败可能留下已解出的文件。</p>
   <p class="pg-hint">断点续传只对「直接下载引擎包」有效：本地包这条路是一次解压，中途断了就是重来。</p>
 </div>
 
@@ -413,7 +415,7 @@ export function renderPage(cfg: any, status: any = {}, ttsList: any[] = []): str
 
 <p class="pg-sub">装完还有三步</p>
 <div class="pg-item">
-<p class="pg-hint">一、回「引擎」页把<b>引擎程序</b>指到新的 <code>gsv_server.exe</code>，<b>启动参数</b>里的 <code>--models</code> 和 <code>--allow-path</code> 也要跟着改——漏改 <code>--allow-path</code>，合成会一口回 403。<br>
+<p class="pg-hint">一、回「引擎」页把<b>引擎程序</b>指到新的 <code>gsv_server.exe</code>，更新<b>启动参数</b>里的 <code>--models</code> 和 <code>--allow-path</code>，然后保存。<br>
 二、点「启动服务」，等二十几秒，回这一页再点一次「检查缺什么」，不对就去「引擎」页看日志文件。<br>
 三、回「音色」页点「检测引擎里有哪些」，确认原来那几套音色还在；不在就说明 <code>voices\\</code> 没跟过来，得手工拷回来。</p>
 </div>
@@ -745,7 +747,7 @@ function depWatch() {
       var phase = { download: "下载中", verify: "校验中", extract: "解压中", done: "完成", failed: "失败" }[j.phase] || j.phase;
       var lines = [phase + (pct === null ? "" : " " + pct + "%") + " · " + Math.round(j.bytes / 1048576) + (j.total ? " / " + Math.round(j.total / 1048576) : "") + " MB"];
       lines.push("文件：" + j.dest);
-      lines.push("解到：" + j.root);
+      lines.push("解到：" + j.into);
       if (j.error) lines.push("原因：" + j.error);
       depOut(j.phase === "failed" ? "err" : j.phase === "done" ? "ok" : "wait", lines);
       if (j.phase === "done" || j.phase === "failed") { depStop(); if (j.phase === "done") depCheck(); return; }
@@ -758,10 +760,10 @@ function depWatch() {
 }
 $("dep_check").onclick = function () { depCheck(); };
 $("dep_engine").onclick = async function () {
-  if (!confirm("下载 gsv.cpp 引擎（约 15 MB，只有 exe 和两个 ggml dll，不含 sidecar / python / 模型）并解压？")) return;
+  if (!confirm("下载 gsv.cpp 引擎（约 15 MB，含 exe 和四个 ggml DLL）并解压？同名文件会被覆盖。")) return;
   try {
     var r = await post("/plugins/voice-gsv/deploy/start", { root: $("dep_root").value.trim(), mode: "engine" });
-    depOut("wait", ["已开始：" + r.id, "解到：" + r.root, r.note || ""]);
+    depOut("wait", ["已开始：" + r.id, "解到：" + r.into]);
     depWatch();
   } catch (error) {
     depOut("err", ["起不来：" + (error && error.message ? error.message : error)]);
@@ -865,7 +867,7 @@ async function saveAll() {
       stop_on_exit: $("stop_on_exit").checked,
       exe: $("exe").value,
       cwd: $("cwd").value,
-      args: $("args").value,
+      args: $("args").value.split(String.fromCharCode(10)),
       log: $("log").value,
       host: $("host").value,
       port: $("port").value,
