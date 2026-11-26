@@ -236,8 +236,8 @@ gsv.cpp 的 `/change_refer` 能让引擎记住一套参考音，之后 `/tts` �
 
 ```powershell
 New-Item -ItemType Junction `
-  -Path   'K:\gsv.cpp\GSV\runtime\frontend\frontend\GPT_SoVITS\pretrained_models\fast_langdetect' `
-  -Target 'K:\gsv.cpp\GSV\runtime\models\frontend\fast_langdetect'
+  -Path   '<引擎目录>\runtime\frontend\frontend\GPT_SoVITS\pretrained_models\fast_langdetect' `
+  -Target '<引擎目录>\runtime\models\frontend\fast_langdetect'
 ```
 
 - `--allow-path` 必须包含参考音所在目录，否则 403
