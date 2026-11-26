@@ -43,7 +43,7 @@ const DEFAULTS = {
   /** 原样交给引擎、不做中文化的英文缩写（页面上能改）。默认那几个单位按英文词组念。 */
   pronounce_keep: [...KEEP_DEFAULT] as string[],
   /** 强制按中文念的词，写「词」或「词=读法」；同一词两边都写时这一份优先。 */
-  pronounce_cn: [] as string[],
+  pronounce_cn: ["ms=毫秒", "px=像素", "pt=磅", "cm=厘米", "mm=毫米"] as string[],
   timeout_ms: 120_000,
   out_dir: join(HERE, "data", "out"),
   engine: "local",
@@ -398,7 +398,8 @@ export async function apply(ctx: Context) {
   let cfg: Config = { ...DEFAULTS } as Config;
   let g: GsvConfig = DEFAULTS.gsv;
   let busy = false;
-  const queue: string[] = [];
+  // 队列项带语速和音色：排队的那句不该被按默认参数重念一遍。
+  const queue: { text: string; speed?: number; voice?: string }[] = [];
   /** 每次「掐断」加一。合成/播放的循环带着本轮号，号一变就知道自己该收手了。 */
   let gen = 0;
   const CANCELLED = "念话被打断";
@@ -460,9 +461,9 @@ export async function apply(ctx: Context) {
     void (async () => {
       try {
         while (queue.length) {
-          const next = queue.shift() as string;
+          const next = queue.shift() as { text: string; speed?: number; voice?: string };
           try {
-            await speakText(next);
+            await speakText(next.text, next.speed, next.voice);
           } catch (error: any) {
             const msg = String(error?.message ?? error);
             if (msg === CANCELLED) ctx.logger?.info?.("嗓子：这一段被新的一句顶掉了");
@@ -520,19 +521,19 @@ export async function apply(ctx: Context) {
     return "";
   }
 
-  function enqueue(text: string) {
+  function enqueue(text: string, speed?: number, voice?: string) {
     if (cfg.interrupt_reading && (busy || queue.length)) {
       // 勾了「新的顶掉旧的」：掐掉正在念的，排队的也一起清，然后只念这一句。
       // 这里不等它落定——pump 起来还要先合成（几百毫秒），等合成完那个播放进程早没了。
       void cancelSpeech();
     }
-    enqueuePending(text);
+    enqueuePending(text, speed, voice);
   }
 
   /** 已处理过打断的请求直接入队，保留原来的代际号与待播队列。 */
-  function enqueuePending(text: string) {
+  function enqueuePending(text: string, speed?: number, voice?: string) {
     if (queue.length >= 2) queue.shift();
-    queue.push(text);
+    queue.push({ text, speed, voice });
     pump();
   }
 
@@ -933,7 +934,7 @@ export async function apply(ctx: Context) {
   }
 
   /** 长文：清洗、分段、逐段合成播放。 */
-  async function speakText(rawText: string) {
+  async function speakText(rawText: string, speed?: number, voiceName?: string) {
     const mine = gen;
     const check = () => {
       if (mine !== gen) throw new Error(CANCELLED);
@@ -966,7 +967,7 @@ export async function apply(ctx: Context) {
     // 不做波形拼接——那样容易把头写坏，也不做交叉淡化。
     const piped = cfg.pipe_sentences !== false && parts.length > 1;
     if (piped) {
-      const take = (text: string) => synth(text).then((buf) => ({ buf } as const), (error) => ({ error } as const));
+      const take = (text: string) => synth(text, speed, voiceName).then((buf) => ({ buf } as const), (error) => ({ error } as const));
       let pending = take(parts[0]);
       for (let i = 0; i < parts.length; i += 1) {
         const now = await pending;
@@ -979,7 +980,7 @@ export async function apply(ctx: Context) {
     } else {
       for (const part of parts) {
         check();
-        const buf = await synth(part);
+        const buf = await synth(part, speed, voiceName);
         check();
         await playSegment(buf);
       }
@@ -1030,8 +1031,8 @@ export async function apply(ctx: Context) {
           await waitIdle(mine);
           if (mine !== gen) throw new Error(CANCELLED);
           if (busy) {
-            enqueuePending(text);
-            return `已排队：${text.slice(0, 40)}${text.length > 40 ? "…" : ""}\n上一段还在收尾，这句排在它后面念。${warn ? "\n注意：" + warn : ""}`;
+            enqueuePending(text, args?.speed, args?.voice);
+            return `已排队：${text.slice(0, 40)}${text.length > 40 ? "…" : ""}\n上一段还在收尾，这句排在它后面念。这一句没有播放入口标记——声音会出来，但页面上不会有播放器。${warn ? "\n注意：" + warn : ""}`;
           }
         } else throw new Error("上一段还在念，等它念完再试");
       }
