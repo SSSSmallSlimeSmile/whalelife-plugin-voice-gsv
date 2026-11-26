@@ -1274,11 +1274,13 @@ export async function apply(ctx: Context) {
           const path = join(dir, name);
           const info = await stat(path).catch(() => null);
           if (!info || !info.isFile()) continue;
+          const hit = known.find((one) => one && String(one.ref_audio || "") === path);
           items.push({
             name,
             path,
             bytes: info.size,
-            registered: known.some((one) => one && String(one.ref_audio || "") === path),
+            registered: Boolean(hit),
+            voice: hit ? String(hit.name || "") : "",
           });
         }
       }
@@ -1289,6 +1291,29 @@ export async function apply(ctx: Context) {
         voices: known.map((one) => ({ name: one?.name ?? "", ref_audio: one?.ref_audio ?? "", prompt_text: one?.prompt_text ?? "", prompt_lang: one?.prompt_lang ?? "" })),
         current: String(cfg.voice_name || ""),
       });
+    } catch (error: any) {
+      return replyJson(res, 500, { ok: false, error: error?.message ?? String(error) });
+    }
+  });
+
+  // 打开文件夹：只给「引擎」页那两个按钮用。只认固定几个目录，不收任意路径；只弹资源管理器，不动文件。
+  ctx.web.api("/plugins/voice-gsv/open-folder", async (req: any, res: any) => {
+    try {
+      await reload();
+      const body: any = await readBody(req);
+      const which = String(body?.which ?? "voices");
+      const argsList: string[] = Array.isArray(g.args) ? (g.args as string[]) : [];
+      let modelsDir = "";
+      for (let i = 0; i < argsList.length - 1; i += 1) {
+        if (argsList[i] === "--models" && argsList[i + 1]) modelsDir = argsList[i + 1];
+      }
+      if (!modelsDir && g.exe) modelsDir = join(dirname(g.exe), "..", "models");
+      if (!modelsDir) return replyJson(res, 400, { ok: false, error: "启动参数里没有 --models，推不出模型目录。" });
+      const dir = which === "root" ? modelsDir : which === "refs" ? (allowDirs()[0] || "") : join(modelsDir, "voices");
+      if (!dir) return replyJson(res, 400, { ok: false, error: "没有可打开的目录：启动参数里没有 --allow-path。" });
+      if (!existsSync(dir)) return replyJson(res, 404, { ok: false, error: "目录不存在：" + dir });
+      spawn("explorer.exe", [dir], { detached: true, stdio: "ignore" }).unref();
+      return replyJson(res, 200, { ok: true, dir });
     } catch (error: any) {
       return replyJson(res, 500, { ok: false, error: error?.message ?? String(error) });
     }

@@ -266,3 +266,15 @@ New-Item -ItemType Junction `
 - 状态接口读到 `open:true, pids:[20004]`（gsv_server 在跑）
 
 **没验的**：云端那条路（`engine != local`）这轮没打过；真浏览器里点保存那一跳；长文分段播放的实际听感。
+
+## 随包的试听句 demo/kan-demo.wav
+
+`demo/kan-demo.wav`（5.68 秒，48 kHz 单声道 16 bit）是插件自己合成的一句：
+
+> 我是勘。这一声是随包带的试听，用的就是卡座上的音色。
+
+**只含合成音频，不含任何声音素材。** 它不是从谁的录音里剪的，也不是参考音——它是 gsv.cpp 拿一段参考音现算出来的结果。所以随包发出去不涉及素材许可。
+
+**它不能当参考音用。** 想自己配一套音色，仍需自备一段 10–20 秒、单人说、无背景的录音，加上它逐字对应的文本。拿这条 demo 去当参考音，等于让模型学自己——会越训越糊。
+
+生成参数（要复现就照这个发 `POST /tts`）：`voice=kanturbo`、`sample_steps=4`、`speed_factor=1.1`、`text_split_method=cut5`、`seed=20261127`，参考音用的 `furina_ref23.wav` + 它那段文本。

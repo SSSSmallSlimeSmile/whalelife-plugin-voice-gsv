@@ -313,7 +313,7 @@ export function renderPage(cfg: any, status: any = {}, ttsList: any[] = []): str
 
 <div class="pg-pair">
   <div class="pg-item"><div class="pg-row"><label class="pg-label" for="new_text">这段音频说的是什么</label><input type="text" id="new_text"><p class="pg-hint">要跟音频逐字对应，写错音色会飘。</p></div></div>
-  <div class="pg-item"><div class="pg-row"><label class="pg-label">操作</label><div class="pg-btns" style="margin:0"><button class="btn" type="button" id="reload_refs">读目录</button><button class="btn" type="button" id="save_voice">存成音色</button><button class="btn" type="button" id="check_ref">检查参考音</button><button class="btn" type="button" id="del_voice">删掉选中的</button></div><p class="pg-hint" id="voice_list">—</p></div></div>
+  <div class="pg-item"><div class="pg-row"><label class="pg-label">操作</label><div class="pg-btns" style="margin:0"><button class="btn" type="button" id="reload_refs">读目录</button><button class="btn" type="button" id="save_voice">存成音色</button><button class="btn" type="button" id="check_ref">检查参考音</button><button class="btn" type="button" id="del_voice">删掉选中的</button></div><p class="pg-hint" id="voice_list">—</p><div class="pg-hint" id="voice_detail" style="margin-top:6px"></div></div></div>
 </div>
 
 <p class="pg-sub">手填 · 不用音色库时用这对</p>
@@ -334,6 +334,7 @@ export function renderPage(cfg: any, status: any = {}, ttsList: any[] = []): str
 </div>
 
 <p class="pg-sub">引擎程序（gsv_server.exe）</p>
+<div class="pg-item"><div class="pg-row"><label class="pg-label">音色与模型文件夹</label><div class="pg-btns" style="margin:0"><button class="btn" type="button" id="open_voices">打开音色文件夹</button><button class="btn" type="button" id="open_models">打开模型根目录</button></div><p class="pg-hint">路径按启动参数里的 <code>--models</code> 推，推不出来就看下面那行工作目录。<br>一套音色 = <code>voices\&lt;名字&gt;\manifest.json</code> 加对应的 cond/dit 两个 gguf。<b>加</b>：新建文件夹、放这三样，重启引擎后「检测引擎里有哪些」才列得出来。<b>删</b>：整个文件夹挪走就行，不用改配置（配置里点名的音色被删了会静默换嗓子，记得一起改）。<br>这两个按钮只在本机弹出资源管理器，不读、不改、不删任何文件。引擎跑着的时候别动它正在用的那套，改完要重启才认。</p></div></div>
 <div class="pg-pair">
   <div class="pg-item"><div class="pg-row"><label class="pg-label" for="exe">引擎程序</label><input type="text" id="exe" value="${esc(g.exe)}" placeholder="...\\gsv\\gsv_server.exe"><p class="pg-hint">gsv.cpp 的 gsv_server.exe。路径写错启动会静默失败，看下面的日志。</p></div></div>
   <div class="pg-item"><div class="pg-row"><label class="pg-label" for="cwd">工作目录</label><input type="text" id="cwd" value="${esc(g.cwd)}" placeholder="...\\GSV\\runtime\\gsv"><p class="pg-hint">参数里的相对路径按这里算，留空就用程序所在目录。</p></div></div>
@@ -384,6 +385,20 @@ function voicePaint() {
   }).join("");
   sel.value = VOICES.some(function (v) { return v.name === now; }) ? now : "";
   $("voice_list").textContent = VOICES.length ? "库里有：" + VOICES.map(function (v) { return v.name; }).join("、") : "库里还是空的。";
+  const box = $("voice_detail");
+  if (box) {
+    box.innerHTML = "";
+    if (!VOICES.length) {
+      box.textContent = "库里还没有音色。挑一个参考音、填上它说的是什么，点「存成音色」。";
+    } else {
+      VOICES.forEach(function (v) {
+        const line = document.createElement("div");
+        const file = String(v.ref_audio || "").split(/[\\/]/).pop() || "（没填音频）";
+        line.textContent = "· " + (v.name || "（无名）") + " — " + file + " — " + (v.prompt_text ? "「" + v.prompt_text + "」" : "文本空着，音色会飘");
+        box.appendChild(line);
+      });
+    }
+  }
 }
 function voiceSync() {
   const name = $("voice_name").value;
@@ -404,7 +419,7 @@ async function loadRefs() {
     $("refs_label").textContent = "参考音目录里的文件（" + items.length + " 个）";
     sel.innerHTML = '<option value="" disabled selected>（选一个）</option>' + items.map(function (it) {
       const base = String(it.name || "").replace(/[.]wav$/i, "");
-      return '<option value="' + esc(it.path) + '" data-base="' + esc(base) + '">' + esc(it.name) + (it.registered ? "（已入库）" : "") + "</option>";
+      return '<option value="' + esc(it.path) + '" data-base="' + esc(base) + '" data-voice="' + esc(it.voice || "") + '">' + esc(it.name) + (it.registered ? "（已入库）" : "") + "</option>";
     }).join("");
     const dirs = Array.isArray(r.dirs) ? r.dirs : [];
     show("ok", "读到 " + items.length + " 个参考音。目录：" + (dirs.join("；") || "（没有 --allow-path）"));
@@ -576,7 +591,15 @@ $("refs").onchange = () => {
   if (!opt || !opt.value) return;
   $("new_ref").value = opt.value;
   $("new_voice").value = opt.dataset.base || "";
-  $("new_text").value = "";
+  const libName = opt.dataset.voice || "";
+  const lib = VOICES.filter(function (v) { return v.name === libName; })[0];
+  if (lib) {
+    $("new_text").value = lib.prompt_text || "";
+    show("ok", "这个文件已经在库里（音色「" + lib.name + "」），对应文本已回填" + (lib.prompt_text ? "" : "——但库里那条也是空的，得补上"));
+  } else {
+    $("new_text").value = "";
+    show("wait", "这个文件还没入库。在下面填上「它说的是什么」，再点「存成音色」。");
+  }
 };
 $("save_voice").onclick = async () => {
   const name = $("new_voice").value.trim();
@@ -591,6 +614,16 @@ $("save_voice").onclick = async () => {
   show("wait", "正在保存音色…");
   await saveAll();
 };
+async function openFolder(which) {
+  try {
+    const r = await post("/plugins/voice-gsv/open-folder", { which: which });
+    show("ok", "已打开：" + r.dir);
+  } catch (error) {
+    show("err", "打不开：" + (error && error.message ? error.message : error));
+  }
+}
+$("open_voices").onclick = () => { openFolder("voices"); };
+$("open_models").onclick = () => { openFolder("root"); };
 $("del_voice").onclick = async () => {
   const name = $("voice_name").value;
   if (!name) return show("err", "先在上面选一个音色。");
