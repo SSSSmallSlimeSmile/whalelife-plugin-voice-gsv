@@ -351,7 +351,7 @@ export function renderPage(cfg: any, status: any = {}, ttsList: any[] = []): str
 
 <p class="pg-sub">伴随行为</p>
 <div class="pg-pair">
-  <div class="pg-item"><div class="pg-row"><div class="pg-check"><input type="checkbox" id="auto_start"${g.auto_start ? " checked" : ""}><label class="pg-label" for="auto_start">WhaleLife 开启时自动拉起语音服务</label></div><p class="pg-hint">默认关着，手动点「启动服务」。勾上后主程序起来会检查端口，已经在跑就不重复拉起。</p></div></div>
+  <div class="pg-item"><div class="pg-row"><div class="pg-check"><input type="checkbox" id="auto_start"${g.auto_start ? " checked" : ""}><label class="pg-label" for="auto_start">跟随宿主启动（宿主起来时自动拉起语音服务）</label></div><p class="pg-hint">默认关着，手动点「启动服务」。勾上后宿主起来会检查端口，已经在跑就不重复拉起。</p></div></div>
   <div class="pg-item"><div class="pg-row"><div class="pg-check"><input type="checkbox" id="stop_on_exit"${g.stop_on_exit ? " checked" : ""}><label class="pg-label" for="stop_on_exit">关闭 WhaleLife 时一并关掉语音服务</label></div><p class="pg-hint">不勾的话，主程序退了服务还留着，下次起来直接复用。</p></div></div>
 </div>
 
