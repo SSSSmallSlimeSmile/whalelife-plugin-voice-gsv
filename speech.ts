@@ -48,7 +48,7 @@ const LETTER: Record<string, string> = {
 };
 
 /** 默认不改写、原样交给引擎的英文缩写。单位按英文词组念，比「吉字节」自然。页面上能改这份名单。 */
-export const KEEP_DEFAULT = ["GB", "MB", "KB", "TB", "GiB", "MiB", "KiB", "ms", "px", "pt", "cm", "mm"];
+export const KEEP_DEFAULT = ["GB", "MB", "KB", "TB", "GiB", "MiB", "KiB"];
 
 /** 常见单位与缩写的口语读法，长的放前面，先吃掉。 */
 const WORDS: [RegExp, string][] = [
@@ -65,6 +65,7 @@ const CN_LOOKUP: Record<string, string> = {
   GB: "吉字节", MB: "兆字节", KB: "千字节", TB: "太字节",
   kHz: "千赫兹", Hz: "赫兹", fps: "帧每秒",
   ms: "毫秒", sec: "秒", secs: "秒",
+  px: "像素", pt: "磅", cm: "厘米", mm: "毫米",
   "UTF-8": "优替艾弗八", JSON: "杰森", API: "接口",
 };
 
