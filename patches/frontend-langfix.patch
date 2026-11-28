@@ -1,0 +1,26 @@
+diff --git a/frontend.py.bak-langfix b/frontend.py
+index ed8c936..263e93d 100644
+--- a/frontend.py.bak-langfix
++++ b/frontend.py
+@@ -29,6 +29,8 @@ import re as _re  # noqa: E402  (script detection for mixed-language routing)
+ _LATIN_RE = _re.compile(r"[A-Za-z]")
+ # Han + kana + hangul: anything the per-language cleaners would drop as "foreign"
+ _CJK_RE = _re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufafa\uac00-\ud7af]")
++_KANA_RE = _re.compile(r"[\u3040-\u30ff\u31f0-\u31ff]")
++_HANGUL_RE = _re.compile(r"[\uac00-\ud7af\u1100-\u11ff\u3130-\u318f]")
+ 
+ # NLTK 数据 (英文 G2P 的 g2p_en 需要 cmudict + averaged_perceptron_tagger_eng)。
+ # 本机 nltk_data 里只有旧的 tagger 名, 而 nltk 3.10 要 `_eng`; 网络又下不动,
+@@ -219,6 +221,12 @@ class Frontend:
+             # and hangul (they produced no phones). Languages the text layer does not know fall
+             # back to zh so nothing disappears.
+             lang = l if l in ("zh", "en", "ja", "ko", "yue") else "zh"
++            # 误判防护: fast_langdetect 常把短的汉字段判成 ja/ko（日语也写汉字），
++            # 段内没有假名/谚文就不是日韩文, 回 zh, 否则那些汉字会按日语音读念出来。
++            if lang == "ja" and not _KANA_RE.search(t):
++                lang = "zh"
++            if lang == "ko" and not _HANGUL_RE.search(t):
++                lang = "zh"
+             if yue and lang == "zh":
+                 lang = "yue"
+             phones, word2ph, norm_text = self._one(t, lang)

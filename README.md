@@ -242,6 +242,8 @@ New-Item -ItemType Junction `
 
 - `--allow-path` 必须包含参考音所在目录，否则 403
 
+- **坑（2026-11-28 修）**：句子只要含一个拉丁字母，就得走 `_auto` 混合分段（`frontend.py` 的 `_needs_auto`），而 `LangSegmenter`/fast_langdetect 会把短的**纯汉字**片段误判成 `ja`，于是那几个汉字按日语音读念出来——听着就是「莫名其妙变成日语」。已改：`_auto` 里判成 `ja` 的段若不含假名、判成 `ko` 的段若不含谚文，一律回 `zh`（真日文带假名，不受影响）。改的是引擎自带脚本，**gsv.cpp 重装会丢**，原件备份在 `runtime/frontend/frontend/frontend.py.bak-langfix`。
+
 ## 念之前会做什么
 
 `forSpeech` 去掉：代码块（换成「代码略」）、行内代码、`[[img:]]` / `[[voice:]]` 标记、图片语法、链接（保留文字）、裸 URL、表格（换成「表格略」）、Windows 路径（换成「（略）」）、Markdown 强调符与标题井号。然后按 `max_chars` 按句切段，逐段合成播放。
