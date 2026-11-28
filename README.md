@@ -332,6 +332,40 @@ New-Item -ItemType Junction `
 
 实测（真宿主）：把 `gsv.exe` 临时指成 notepad.exe 再点停 → 引擎 34612 没被杀，回执照上面那样写明；还原配置后正常停 `34612, 13376`，再起回来 3 秒内 9880/9882 都在。
 
+## 0.5.7：全新环境的第一句、认归属、就绪看 /health
+
+三处，都是「换台机器/开第二个实例」才会撞上的。
+
+**一、文本前端的四个目录变量由插件自己传。**
+
+`text_sidecar.py` 要 `GSV_G2PW_MODEL`、`GSV_BERT_DIR`、`NLTK_DATA`、`GSV_FAST_LANGDETECT` 四个目录，缺 `GSV_G2PW_MODEL` 它会去找默认路径、找不到就去 modelscope 下 600 MB，然后永远不 ready。旧版启动时一个都不传，所以别人第一次合成直接 500。
+
+现在从引擎程序往上推 `<runtime>/models/frontend`，四个目录（含标志文件 `g2pW.onnx` / `vocab.txt` / `lid.176.bin`）在就设，调用方已经显式设过的一律不覆盖。启动日志会写明带了哪几个：
+
+```
+文本前端启动中，端口 9882，pid=37924，已带 GSV_G2PW_MODEL/GSV_BERT_DIR/NLTK_DATA/GSV_FAST_LANGDETECT
+```
+
+**二、就绪判定看 `/health` 的 ready，不再拿「端口通了」当就绪。**
+
+侧车是「先监听、再在后台预热」，端口通的时候 `/g2p` 还在 503。现在 `gsv_start(wait=true)` 轮询 `/health`：引擎 `engine=ready`、前端 `ready=true` 才叫就绪；超时则如实说「端口通了但没报 ready」。`gsv_status` 也分开报「配了没有 / 在跑 / 在跑但还在预热」。
+
+实测（这台机器，干净重启侧车）：`ready=true · warm_ms 4948.4`，同时 `/g2p` 200（40 音素）、`/tts` 200（432044 字节 RIFF）。
+
+**三、停服务按可执行文件全路径认归属。**
+
+两个实例的程序名都叫 `gsv_server.exe`，光比进程名分不出谁是谁。现在多一道：`Get-Process -Id N` 拿到的 `.Path` 必须等于配置里那一格，对不上、或者读不到路径，一律不动，回执把两边路径都写出来：
+
+```
+端口 9880 上的 PID 35524 没动：gsv_server.exe @ K:\gsv.cpp\GSV\runtime\gsv\gsv_server.exe，期望 K:\WhaleLife\.tmp\fake-exe\gsv_server.exe
+```
+
+文本前端那侧同理：从引擎路径推不出 `python.exe`（引擎那格填错了）就整段不动，并单独说一句。实测三条：同名不同路径被拒、引擎停干净（PID 35524 端口释放）、把 exe 指成 notepad.exe 时也只拒不动。
+
+```
+$ pnpm tsc -p tsconfig.voice-check.json   → 0 error
+```
+
 ## 自动念
 
 两层的：`auto_read` 是总开关，`auto_scope` 是勾上之后念哪些。

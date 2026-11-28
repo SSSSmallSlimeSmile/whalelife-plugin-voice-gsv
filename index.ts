@@ -11,6 +11,7 @@ import { once } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, writeFile, open, readdir, stat } from "node:fs/promises";
 import { createConnection } from "node:net";
+import { request } from "node:http";
 import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readBody, renderPage, sanitize } from "./ui.ts";
@@ -220,12 +221,57 @@ function sidecarPlan(cfg: GsvConfig) {
   return { port, exe, script };
 }
 
+/** text_sidecar 那四个目录变量。引擎包自带那份模型就在 <runtime>/models/frontend 下。
+ *  规则两条：调用方显式设过的一律不动；目录（或里面那个标志文件）不在就不设。 */
+function frontendEnv(script: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!script) return out;
+  const runtime = dirname(dirname(script));           // <runtime>/frontend/text_sidecar.py → <runtime>
+  const root = join(runtime, "models", "frontend");
+  const put = (key: string, path: string, marker?: string) => {
+    if (process.env[key]) return;
+    if (!existsSync(marker ? join(path, marker) : path)) return;
+    out[key] = path;
+  };
+  put("GSV_G2PW_MODEL", join(root, "g2pw"), "g2pW.onnx");
+  put("GSV_BERT_DIR", join(root, "bert_tokenizer"), "vocab.txt");
+  put("NLTK_DATA", join(root, "nltk_data"));
+  put("GSV_FAST_LANGDETECT", join(root, "fast_langdetect"), "lid.176.bin");
+  return out;
+}
+
+/** 读 /health。端口没通、对面不是这个服务、回的不是 JSON，一律 null。 */
+function readHealth(port: number, host = "127.0.0.1", timeoutMs = 1500): Promise<any | null> {
+  return new Promise((resolve) => {
+    const req = request({ host, port, path: "/health", method: "GET", timeout: timeoutMs }, (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => { if (body.length < 8192) body += chunk; });
+      res.on("end", () => { try { resolve(JSON.parse(body)); } catch { resolve(null); } });
+    });
+    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.on("error", () => resolve(null));
+    req.end();
+  });
+}
+
 async function gsvStatus(cfg: GsvConfig) {
   const open = await portOpen(cfg.port, cfg.host);
   const pids = open ? await pidByPort(cfg.port).catch(() => []) : [];
   const plan = sidecarPlan(cfg);
   const sidecarOpen = plan.port ? await portOpen(plan.port, cfg.host) : false;
-  return { open, pids, sidecar: { port: plan.port, open: sidecarOpen, ready: Boolean(plan.exe && plan.script) } };
+  const health = sidecarOpen && plan.port ? await readHealth(plan.port, cfg.host) : null;
+  return {
+    open,
+    pids,
+    sidecar: {
+      port: plan.port,
+      open: sidecarOpen,
+      configured: Boolean(plan.exe && plan.script),
+      ready: health?.ready === true,
+      warm_ms: health?.warm_ms ?? null,
+    },
+  };
 }
 
 /** 拉起文本前端。跟引擎是两个进程，各自独立停。 */
@@ -240,10 +286,12 @@ async function sidecarStart(cfg: GsvConfig, logger: { info: (m: string) => void;
     await writeFile(cfg.log, `[${new Date().toISOString()}] ===== text_sidecar start =====\n`, { flag: "a" }).catch(() => {});
     handle = await open(cfg.log, "a").catch(() => null);
   }
+  const env = frontendEnv(plan.script);
   const child = spawn(plan.exe, [plan.script, "--port", String(plan.port)], {
     cwd: dirname(plan.script),
     windowsHide: true,
     detached: true,
+    env: { ...process.env, ...env },
     stdio: ["ignore", handle ? handle.fd : "ignore", handle ? handle.fd : "ignore"],
   });
   try {
@@ -255,8 +303,9 @@ async function sidecarStart(cfg: GsvConfig, logger: { info: (m: string) => void;
   } finally {
     if (handle) await handle.close().catch(() => {});
   }
-  logger.info(`文本前端启动中，端口 ${plan.port}，pid=${child.pid ?? "?"}`);
-  return { started: true, pid: child.pid ?? null, port: plan.port };
+  const envKeys = Object.keys(env);
+  logger.info(`文本前端启动中，端口 ${plan.port}，pid=${child.pid ?? "?"}${envKeys.length ? `，已带 ${envKeys.join("/")}` : ""}`);
+  return { started: true, pid: child.pid ?? null, port: plan.port, env: envKeys };
 }
 
 /** 拉起服务。detached，输出追加进日志，不等模型加载完。 */
@@ -313,18 +362,53 @@ function imageName(pid: number): Promise<string> {
   });
 }
 
+/** 进程的可执行文件全路径。读不到（已经退了、权限不够）回空串。 */
+function imagePath(pid: number): Promise<string> {
+  return new Promise((resolve) => {
+    const cmd = `(Get-Process -Id ${pid} -ErrorAction Stop).Path`;
+    execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", cmd], { windowsHide: true, timeout: 15_000 }, (err, stdout) => {
+      if (err || !stdout) return resolve("");
+      resolve(stdout.trim().replace(/^"|"$/g, ""));
+    });
+  });
+}
+
+function samePath(a: string, b: string) {
+  const n = (one: string) => one.trim().replace(/^"|"$/g, "").replace(/\//g, "\\").toLowerCase();
+  return Boolean(a) && Boolean(b) && n(a) === n(b);
+}
+
 /**
  * 按端口杀，但先认人：映像名对不上就不动它（端口被别的程序占着也不能一锅端）。
+ * 给了期望路径时再比一次可执行文件全路径——两个实例都是 gsv_server.exe，光看进程名分不出谁是谁。
  * 杀完回查端口，真空了才算停——taskkill 失败不再谎报「已结束」。
  */
-async function killPort(port: number, match: ((name: string) => boolean) | null) {
+async function killPort(port: number, match: ((name: string) => boolean) | null, expectedPath = "") {
   const pids = await pidByPort(port);
   const refused: { pid: number; name: string; port: number }[] = [];
   const targets: number[] = [];
+  const wantName = expectedPath ? basename(expectedPath).toLowerCase() : "";
   for (const pid of pids) {
     const name = await imageName(pid);
-    if (!name || !match || !match(name)) refused.push({ pid, name: name || "(读不到进程名)", port });
-    else targets.push(pid);
+    if (!name) {
+      refused.push({ pid, name: "(读不到进程名)", port });
+      continue;
+    }
+    if (wantName ? name.toLowerCase() !== wantName : !match || !match(name)) {
+      refused.push({ pid, name: wantName ? `${name}，期望 ${basename(expectedPath)}` : name, port });
+      continue;
+    }
+    // 同一台机器上可能还开着别人那份 gsv_server.exe：路径必须对上，读不到也当认不出
+    if (!expectedPath) {
+      refused.push({ pid, name: `${name}，找不到本实例的程序路径，认不出归属`, port });
+      continue;
+    }
+    const real = await imagePath(pid);
+    if (!samePath(real, expectedPath)) {
+      refused.push({ pid, name: real ? `${name} @ ${real}，期望 ${expectedPath}` : `${name}，读不到可执行文件路径，认不出归属`, port });
+      continue;
+    }
+    targets.push(pid);
   }
   for (const pid of targets) {
     execFile("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, timeout: 5_000 }, () => {});
@@ -343,22 +427,30 @@ async function killPort(port: number, match: ((name: string) => boolean) | null)
 async function gsvStop(cfg: GsvConfig) {
   const plan = sidecarPlan(cfg);
   const want = cfg.exe ? basename(cfg.exe).toLowerCase() : "";
-  const main = await killPort(cfg.port, want ? (name) => name.toLowerCase() === want : null);
-  const side = plan.port && plan.port !== cfg.port ? await killPort(plan.port, (name) => /^python/i.test(name)) : { stopped: false, pids: [] as number[], refused: [] as any[] };
+  const main = await killPort(cfg.port, want ? (name) => name.toLowerCase() === want : null, cfg.exe);
+  const side = !plan.port || plan.port === cfg.port
+    ? { stopped: false, pids: [] as number[], refused: [] as any[] }
+    : plan.exe
+      ? await killPort(plan.port, (name) => /^python/i.test(name), plan.exe)
+      : { stopped: false, pids: [] as number[], refused: [] as any[] };
   return {
     stopped: main.stopped || side.stopped,
     pids: [...main.pids, ...side.pids],
     refused: [...main.refused, ...side.refused],
     sidecarStopped: side.stopped,
     sidecarPids: side.pids,
+    sidecarSkipped: plan.port && plan.port !== cfg.port && !plan.exe
+      ? `文本前端的程序路径推不出来（引擎程序那一格可能填错了），端口 ${plan.port} 上的进程没动`
+      : "",
   };
 }
 
 /** 停服务的回执：杀掉的、被拒绝的都写出来，不把「没动」说成「已结束」。 */
-function stopMessage(r: { stopped: boolean; pids: number[]; refused: { pid: number; name: string; port: number }[] }, cfg: GsvConfig) {
+function stopMessage(r: { stopped: boolean; pids: number[]; refused: { pid: number; name: string; port: number }[]; sidecarSkipped?: string }, cfg: GsvConfig) {
   const parts: string[] = [];
+  if (r.sidecarSkipped) parts.push(r.sidecarSkipped);
   if (r.pids.length) parts.push(`已尝试结束 PID ${r.pids.join(", ")}。${r.stopped ? "至少一个目标端口已确认释放" : "未能确认目标端口已释放，进程可能已退出"}`);
-  for (const one of r.refused) parts.push(`端口 ${one.port} 上的 PID ${one.pid}（${one.name}）未通过进程识别，未结束`);
+  for (const one of r.refused) parts.push(`端口 ${one.port} 上的 PID ${one.pid} 没动：${one.name}`);
   if (!parts.length) {
     const ports = [...new Set([cfg.port, sidecarPlan(cfg).port])];
     return `端口 ${ports.join("、")} 未发现监听进程，没什么可停的`;
@@ -366,13 +458,18 @@ function stopMessage(r: { stopped: boolean; pids: number[]; refused: { pid: numb
   return parts.join("；");
 }
 
-async function waitPort(cfg: GsvConfig, ms: number) {
+/** 等引擎真就绪：看 /health 报的 ready，不是端口通了就算。超时返回当时的状态。 */
+async function waitEngine(cfg: GsvConfig, ms: number) {
   const deadline = Date.now() + ms;
-  while (Date.now() < deadline) {
-    if (await portOpen(cfg.port, cfg.host)) return true;
-    await new Promise((r) => setTimeout(r, 2000));
+  let portUp = false;
+  let health: any = null;
+  while (true) {
+    health = await readHealth(cfg.port, cfg.host);
+    if (health && (health.engine === "ready" || health.ready === true)) return { ready: true, portUp: true, health };
+    if (!portUp) portUp = await portOpen(cfg.port, cfg.host);
+    if (Date.now() >= deadline) return { ready: false, portUp, health };
+    await new Promise((r) => setTimeout(r, 1500));
   }
-  return false;
 }
 
 /** 支持 ${ENV:NAME} 形式的引用，凭据本身不必写进任何配置文件 */
@@ -1079,7 +1176,13 @@ export async function apply(ctx: Context) {
     run: async () => {
       await reload();
       const s = await gsvStatus(g);
-      const sc = s.sidecar.open ? "在跑" : s.sidecar.ready ? "没起" : "没配";
+      const sc = s.sidecar.open
+      ? s.sidecar.ready
+        ? `在跑且已就绪（预热 ${s.sidecar.warm_ms ?? "?"} ms）`
+        : "在跑，还在预热（这时合成会 503/500）"
+      : s.sidecar.configured
+        ? "没起"
+        : "没配";
       if (!s.open) return `未在运行（${g.host}:${g.port} 连不上）；文本前端${sc}（端口 ${s.sidecar.port}）`;
       return `在运行（${g.host}:${g.port}），PID：${s.pids.join(", ") || "查不到"}；文本前端${sc}（端口 ${s.sidecar.port}）`;
     },
@@ -1088,10 +1191,10 @@ export async function apply(ctx: Context) {
   ctx.tools.register({
     name: "gsv_start",
     description:
-      "按配置拉起语音服务（gsv_server.exe），默认不等模型加载完就返回。wait 为 true 时等到端口通，最多 3 分钟。",
+      "按配置拉起语音服务（gsv_server.exe），默认不等模型加载完就返回。wait 为 true 时等 /health 报 ready，最多 3 分钟。",
     schema: {
       type: "object",
-      properties: { wait: { type: "boolean", description: "是否等到端口可用，默认 false" } },
+      properties: { wait: { type: "boolean", description: "是否等到 /health 报 ready，默认 false" } },
     },
     danger: "ask",
     run: safe(async (args: any) => {
@@ -1104,10 +1207,18 @@ export async function apply(ctx: Context) {
       }
       const scNote = r.sidecar?.started ? `，文本前端也起了（端口 ${r.sidecar.port}）` : `，文本前端没起：${r.sidecar?.reason ?? "未知"}（它不在，英文和多语种会 500）`;
       if (args?.wait !== true) return `已拉起（pid=${r.pid ?? "?"}）${scNote}，模型加载要几十秒，用 gsv_status 看。`;
-      const up = await waitPort(g, g.start_wait_ms);
-      if (!up) return `已拉起，但 3 分钟内端口还没通，看日志 ${g.log}`;
+      const up = await waitEngine(g, g.start_wait_ms);
+      if (!up.portUp) return `已拉起，但 ${Math.round(g.start_wait_ms / 1000)} 秒内端口还没通，看日志 ${g.log}`;
+      if (!up.ready) return `端口通了，但引擎没报 ready（${JSON.stringify(up.health)}），看日志 ${g.log}`;
+      const plan = sidecarPlan(g);
+      const sc = plan.port ? await readHealth(plan.port, g.host) : null;
+      const scState = sc?.ready
+        ? `，文本前端已就绪（预热 ${sc.warm_ms ?? "?"} ms）`
+        : sc
+          ? "，文本前端还在预热"
+          : "，文本前端没起";
       const synced = await syncRefer(true);
-      return `已就绪（${g.host}:${g.port}）${synced ? "，默认音色已同步" : referSync.error ? `，默认音色没同步上：${referSync.error}` : ""}`;
+      return `已就绪（${g.host}:${g.port}）${scState}${synced ? "，默认音色已同步" : referSync.error ? `，默认音色没同步上：${referSync.error}` : ""}`;
     }),
   });
 
